@@ -1,0 +1,43 @@
+{
+  "name": "ai-team",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Tim AI pribadi (QA / Software Engineer / DevOps) di atas sesi login Claude",
+  "scripts": {
+    "check:auth": "tsx scripts/check-auth.ts",
+    "check:browser": "tsx scripts/check-browser.ts",
+    "server": "tsx server/main.ts",
+    "web": "vite",
+    "dev": "node scripts/dev.mjs",
+    "build": "vite build",
+    "start": "npm run build && tsx server/main.ts",
+    "typecheck": "tsc --noEmit",
+    "check:mcp": "tsx scripts/check-mcp.ts",
+    "migrate:v1": "tsx scripts/migrate-v1.ts",
+    "check:policy": "tsx scripts/check-policy.ts"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "0.3.310",
+    "express": "5.3.0",
+    "markdown-it": "15.0.3",
+    "playwright": "1.64.1",
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
+    "react-router-dom": "^7.18.5",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "4.3.3",
+    "@types/express": "5.0.6",
+    "@types/markdown-it": "14.2.0",
+    "@types/node": "26.6.5",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "@vitejs/plugin-react": "6.1.2",
+    "tailwindcss": "4.3.3",
+    "tsx": "4.23.15",
+    "typescript": "7.0.2",
+    "vite": "8.3.5"
+  }
+}

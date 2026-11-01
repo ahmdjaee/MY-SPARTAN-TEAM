@@ -1,0 +1,71 @@
+import { mkdirSync } from "node:fs";
+import { join, resolve } from "node:path";
+
+try {
+  process.loadEnvFile(join(process.cwd(), ".env"));
+} catch {
+  // .env opsional
+}
+
+function str(name: string, fallback: string): string {
+  const v = process.env[name];
+  return v === undefined || v === "" ? fallback : v;
+}
+
+function num(name: string, fallback: number): number {
+  const v = Number(process.env[name]);
+  return Number.isFinite(v) && v > 0 ? v : fallback;
+}
+
+const EFFORTS = ["low", "medium", "high", "xhigh", "max"] as const;
+type Effort = (typeof EFFORTS)[number];
+
+function effort(name: string, fallback: Effort): Effort {
+  const value = process.env[name];
+  return EFFORTS.includes(value as Effort) ? (value as Effort) : fallback;
+}
+
+const dataDir = resolve(str("DATA_DIR", "./data"));
+const workspaceDir = resolve(str("WORKSPACE_DIR", join(process.cwd(), "workspace")));
+
+export const CONFIG = {
+  host: str("HOST", "127.0.0.1"),
+  port: num("PORT", 4320),
+  workspaceDir,
+  dataDir,
+  tasksDir: join(dataDir, "tasks"),
+  counterPath: join(dataDir, "counter.json"),
+  memoryPath: join(dataDir, "memory.md"),
+  /** Folder laporan v1 — hanya dipakai skrip migrasi. */
+  legacyReportsDir: join(dataDir, "reports"),
+  models: {
+    qa: str("MODEL_QA", "claude-sonnet-5-5"),
+    engineer: str("MODEL_ENGINEER", "claude-opus-5"),
+    devops: str("MODEL_DEVOPS", "claude-opus-5"),
+  },
+  effort: {
+    qa: effort("EFFORT_QA", "high"),
+    engineer: effort("EFFORT_ENGINEER", "high"),
+    devops: effort("EFFORT_DEVOPS", "medium"),
+  },
+  maxConcurrentAgents: num("MAX_CONCURRENT_AGENTS", 2),
+  /** Tutup subprocess Claude Code setelah sekian lama tugas menganggur; sesi tetap bisa dilanjutkan. */
+  idleShutdownMs: num("IDLE_SHUTDOWN_MS", 10 * 60_000),
+  includeUserSettings: str("INCLUDE_USER_SETTINGS", "0") === "1",
+  targetUrl: str("TARGET_URL", ""),
+} as const;
+
+/**
+ * Environment untuk subprocess Claude Code.
+ * ANTHROPIC_API_KEY sengaja dihapus supaya SDK memakai sesi login OAuth
+ * yang sudah ada di ~/.claude, bukan jalur API key.
+ */
+export function agentEnv(): Record<string, string | undefined> {
+  return { ...process.env, ANTHROPIC_API_KEY: undefined, ANTHROPIC_AUTH_TOKEN: undefined };
+}
+
+export function ensureDirs(): void {
+  for (const dir of [CONFIG.dataDir, CONFIG.tasksDir, CONFIG.workspaceDir]) {
+    mkdirSync(dir, { recursive: true });
+  }
+}

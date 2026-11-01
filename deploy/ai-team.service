@@ -1,0 +1,32 @@
+[Unit]
+Description=AI Team (QA / Engineer / DevOps) di http://127.0.0.1:4320
+After=network-online.target
+
+[Service]
+Type=simple
+
+# WAJIB: server/config.ts memanggil process.loadEnvFile(cwd + "/.env"), dan .env
+# memakai DATA_DIR=./data — jadi cwd menentukan .env sekaligus folder data.
+WorkingDirectory=/var/www/ai-team
+
+# WAJIB: Agent SDK memanggil `claude` dari PATH (tidak ada node_modules/.bin/claude;
+# yang dipakai ~/.local/bin/claude). Tanpa ini server tampak sehat tapi semua tugas gagal.
+# Node datang dari nvm, jadi versinya eksplisit — ini satu-satunya tempat yang perlu
+# disunting kalau node di-upgrade lewat nvm.
+Environment=PATH=%h/.nvm/versions/node/v26.3.0/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=NODE_ENV=production
+
+ExecStart=/usr/bin/env npx tsx server/main.ts
+
+Restart=on-failure
+RestartSec=5
+# Beri ruang untuk shutdown() di server/main.ts (scheduler.closeAll) sebelum SIGKILL.
+# KillMode bawaan (control-group) membereskan proses claude & Chromium milik agen.
+TimeoutStopSec=20
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ai-team
+
+[Install]
+WantedBy=default.target

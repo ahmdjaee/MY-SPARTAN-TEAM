@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Demo Login — target uji QA</title>
+  <style>
+    body { font-family: system-ui, sans-serif; background: #0f172a; color: #e2e8f0; display: grid; place-items: center; min-height: 100vh; margin: 0; }
+    form { background: #1e2937; padding: 28px; border-radius: 12px; width: 320px; box-shadow: 0 10px 30px rgba(0,0,0,.4); }
+    h1 { font-size: 18px; margin: 0 0 18px; }
+    label { display: block; font-size: 13px; margin: 12px 0 4px; color: #94a3b8; }
+    input { width: 100%; padding: 9px 10px; border-radius: 8px; border: 1px solid #33415a; background: #0f172a; color: #e2e8f0; box-sizing: border-box; }
+    button { margin-top: 18px; width: 100%; padding: 10px; border: 0; border-radius: 8px; background: #6366f1; color: white; font-weight: 600; cursor: pointer; }
+    #pesan { margin-top: 14px; font-size: 13px; min-height: 18px; }
+    .ok { color: #4ade80; } .err { color: #f87171; }
+  </style>
+</head>
+<body>
+  <form id="form">
+    <h1>Masuk ke Demo App</h1>
+    <label for="email">Email</label>
+    <input id="email" name="email" type="text" placeholder="nama@contoh.com" />
+    <label for="password">Password</label>
+    <input id="password" name="password" type="password" />
+    <button type="submit" id="submit">Masuk</button>
+    <p id="pesan"></p>
+  </form>
+  <script>
+    const form = document.getElementById("form");
+    const pesan = document.getElementById("pesan");
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      const email = document.getElementById("email").value;
+      const password = document.getElementById("password").value;
+      if (email.length === 0) {
+        pesan.className = "err";
+        pesan.textContent = "Email wajib diisi.";
+        return;
+      }
+      if (password.length === 0) {
+        pesan.className = "err";
+        pesan.textContent = "Password wajib diisi.";
+        return;
+      }
+      if (email === "owner@contoh.com" && password === "rahasia123") {
+        pesan.className = "ok";
+        pesan.textContent = "Login berhasil. Mengalihkan ke dashboard…";
+        return;
+      }
+      pesan.className = "err";
+      pesan.textContent = "Email atau password salah.";
+    });
+  </script>
+</body>
+</html>

@@ -1,0 +1,189 @@
+@import "tailwindcss";
+
+/*
+ * Palet bergaya Notion: abu hangat, teks #37352f, aksen biru.
+ * Semua komponen memakai token semantik di bawah ini — tidak ada warna mentah
+ * di className, supaya ganti tema cukup di satu tempat.
+ */
+:root {
+  --page: #ffffff;
+  --panel: #f7f7f5;
+  --raised: #ffffff;
+  --sunken: #f7f6f3;
+  --hover: #efefed;
+  --line: #e9e9e7;
+  --line-strong: #dcdcd9;
+  --ink: #37352f;
+  --muted: #787774;
+  --faint: #9b9a97;
+  --accent: #2383e2;
+  --accent-hover: #0b6bcb;
+  --accent-ink: #1a6cb8;
+  --accent-soft: #e7f1fb;
+  --on-accent: #ffffff;
+
+  --tag-gray-bg: #f1f1ef;
+  --tag-gray-ink: #5a594f;
+  --tag-blue-bg: #e7f3f8;
+  --tag-blue-ink: #1c5e86;
+  --tag-yellow-bg: #fbf3db;
+  --tag-yellow-ink: #8a6513;
+  --tag-orange-bg: #faebdd;
+  --tag-orange-ink: #9a5717;
+  --tag-green-bg: #edf3ec;
+  --tag-green-ink: #2a6b43;
+  --tag-red-bg: #fdebec;
+  --tag-red-ink: #b1322e;
+
+  --scrim: rgba(15, 15, 15, 0.5);
+  --code-ink: #c4554d;
+  color-scheme: light;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --page: #191919;
+    --panel: #202020;
+    --raised: #252525;
+    --sunken: #1c1c1c;
+    --hover: #2c2c2c;
+    --line: #2f2f2f;
+    --line-strong: #3f3f3f;
+    --ink: #e4e4e2;
+    --muted: #9b9b99;
+    --faint: #727270;
+    --accent: #3d9df3;
+    --accent-hover: #5aadf6;
+    --accent-ink: #6cb8f7;
+    --accent-soft: #17344d;
+    --on-accent: #0b1620;
+
+    --tag-gray-bg: #2c2c2c;
+    --tag-gray-ink: #b3b3b1;
+    --tag-blue-bg: #15324a;
+    --tag-blue-ink: #86c2ea;
+    --tag-yellow-bg: #3a2f17;
+    --tag-yellow-ink: #e8c477;
+    --tag-orange-bg: #3b2715;
+    --tag-orange-ink: #e9a872;
+    --tag-green-bg: #1b3326;
+    --tag-green-ink: #8fc9a4;
+    --tag-red-bg: #3b1d1d;
+    --tag-red-ink: #ef9a97;
+
+    --scrim: rgba(0, 0, 0, 0.62);
+    --code-ink: #e78e86;
+    color-scheme: dark;
+  }
+}
+
+:root[data-theme="dark"] {
+  --page: #191919;
+  --panel: #202020;
+  --raised: #252525;
+  --sunken: #1c1c1c;
+  --hover: #2c2c2c;
+  --line: #2f2f2f;
+  --line-strong: #3f3f3f;
+  --ink: #e4e4e2;
+  --muted: #9b9b99;
+  --faint: #727270;
+  --accent: #3d9df3;
+  --accent-hover: #5aadf6;
+  --accent-ink: #6cb8f7;
+  --accent-soft: #17344d;
+  --on-accent: #0b1620;
+
+  --tag-gray-bg: #2c2c2c;
+  --tag-gray-ink: #b3b3b1;
+  --tag-blue-bg: #15324a;
+  --tag-blue-ink: #86c2ea;
+  --tag-yellow-bg: #3a2f17;
+  --tag-yellow-ink: #e8c477;
+  --tag-orange-bg: #3b2715;
+  --tag-orange-ink: #e9a872;
+  --tag-green-bg: #1b3326;
+  --tag-green-ink: #8fc9a4;
+  --tag-red-bg: #3b1d1d;
+  --tag-red-ink: #ef9a97;
+
+  --scrim: rgba(0, 0, 0, 0.62);
+  --code-ink: #e78e86;
+  color-scheme: dark;
+}
+
+@theme inline {
+  --font-sans: ui-sans-serif, -apple-system, "Segoe UI", Inter, system-ui, sans-serif;
+  --font-mono: ui-monospace, "SFMono-Regular", Menlo, monospace;
+
+  --color-page: var(--page);
+  --color-panel: var(--panel);
+  --color-raised: var(--raised);
+  --color-sunken: var(--sunken);
+  --color-hover: var(--hover);
+  --color-line: var(--line);
+  --color-line-strong: var(--line-strong);
+  --color-ink: var(--ink);
+  --color-muted: var(--muted);
+  --color-faint: var(--faint);
+  --color-accent: var(--accent);
+  --color-accent-hover: var(--accent-hover);
+  --color-accent-ink: var(--accent-ink);
+  --color-accent-soft: var(--accent-soft);
+  --color-on-accent: var(--on-accent);
+
+  --color-tag-gray: var(--tag-gray-bg);
+  --color-tag-gray-ink: var(--tag-gray-ink);
+  --color-tag-blue: var(--tag-blue-bg);
+  --color-tag-blue-ink: var(--tag-blue-ink);
+  --color-tag-yellow: var(--tag-yellow-bg);
+  --color-tag-yellow-ink: var(--tag-yellow-ink);
+  --color-tag-orange: var(--tag-orange-bg);
+  --color-tag-orange-ink: var(--tag-orange-ink);
+  --color-tag-green: var(--tag-green-bg);
+  --color-tag-green-ink: var(--tag-green-ink);
+  --color-tag-red: var(--tag-red-bg);
+  --color-tag-red-ink: var(--tag-red-ink);
+
+  --color-scrim: var(--scrim);
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--page);
+  color: var(--ink);
+  font-family: var(--font-sans);
+}
+
+::selection {
+  background: var(--accent-soft);
+}
+
+/* Scrollbar ikut tenang seperti Notion */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--line-strong) transparent;
+}
+
+.markdown h1 { @apply mt-6 mb-3 text-xl font-semibold text-ink; }
+.markdown h2 { @apply mt-6 mb-2 text-lg font-semibold text-ink; }
+.markdown h3 { @apply mt-5 mb-2 text-base font-semibold text-ink; }
+.markdown p { @apply my-3 leading-relaxed text-ink; }
+.markdown ul { @apply my-3 list-disc space-y-1 pl-6 text-ink; }
+.markdown ol { @apply my-3 list-decimal space-y-1 pl-6 text-ink; }
+.markdown a { @apply text-accent underline underline-offset-2; }
+.markdown code { @apply rounded bg-sunken px-1.5 py-0.5 font-mono text-[13px]; color: var(--code-ink); }
+.markdown pre { @apply my-3 overflow-x-auto rounded-lg border border-line bg-sunken p-3; }
+.markdown pre code { @apply bg-transparent p-0 text-ink; color: var(--ink); }
+.markdown table { @apply my-4 w-full border-collapse text-sm; }
+.markdown th { @apply border-b border-line px-2 py-1.5 text-left font-semibold text-ink; }
+.markdown td { @apply border-b border-line px-2 py-1.5 align-top text-ink; }
+.markdown img { @apply my-3 max-w-full cursor-zoom-in rounded-lg border border-line; }
+.markdown blockquote { @apply my-3 border-l-2 border-line-strong pl-3 italic text-muted; }
+.markdown hr { @apply my-5 border-line; }

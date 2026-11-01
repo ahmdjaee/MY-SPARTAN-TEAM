@@ -1,0 +1,16 @@
+# dependensi
+node_modules/
+
+# hasil build vite
+dist/
+
+# hasil pekerjaan: tugas, laporan, bukti, memori project, catatan pribadi
+data/
+
+# folder kerja bot — repo milik Anda sendiri, bukan bagian aplikasi ini
+workspace/
+
+# konfigurasi mesin Anda (lihat .env.example)
+.env
+
+*.log
