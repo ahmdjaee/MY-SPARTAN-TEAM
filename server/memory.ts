@@ -25,6 +25,23 @@ export function trimMemory(text: string, max = MAX_CHARS): string {
 }
 
 /**
+ * Pangkas berkas memori sampai muat tanpa membuang tulisan terbaru: butir bertanggal
+ * (`- [YYYY-MM-DD] …`) paling lama yang dibuang lebih dulu. Memotong ekor seperti
+ * trimMemory justru menghapus catatan yang baru saja ditambahkan.
+ */
+export function fitMemory(text: string, max = MAX_CHARS): string {
+  if (text.length <= max) return text;
+  const lines = text.split("\n");
+  let size = text.length;
+  for (let i = 0; i < lines.length && size > max; i += 1) {
+    if (!/^- \[\d{4}-\d{2}-\d{2}\]/.test(lines[i] ?? "")) continue;
+    size -= (lines[i]?.length ?? 0) + 1;
+    lines[i] = "\u0000";
+  }
+  return trimMemory(lines.filter((value) => value !== "\u0000").join("\n"), max);
+}
+
+/**
  * Tambah satu butir di bagian "Catatan tim" sebuah berkas memori.
  * Fungsi murni supaya memori global dan memori per project memakai aturan yang sama.
  */
@@ -49,6 +66,20 @@ export function appendBullet(current: string, note: string, taskId: string): str
     return lines.filter((_value, i) => !drop.has(i)).join("\n");
   }
   return next;
+}
+
+/**
+ * Ganti isi satu bagian `## <heading>` (sampai heading `##` berikutnya), bagian lain utuh.
+ * Kalau bagiannya belum ada, ditambahkan di akhir.
+ */
+export function replaceSection(text: string, heading: string, body: string): string {
+  const lines = text.replace(/\s*$/, "").split("\n");
+  const start = lines.findIndex((line) => line.trim() === `## ${heading}`);
+  const content = body.trim();
+  if (start < 0) return `${lines.join("\n")}\n\n## ${heading}\n${content}\n`;
+  let end = lines.findIndex((line, i) => i > start && /^#{1,2}\s+\S/.test(line));
+  if (end < 0) end = lines.length;
+  return [...lines.slice(0, start + 1), content, ...(end < lines.length ? ["", ...lines.slice(end)] : [])].join("\n").replace(/\s*$/, "\n");
 }
 
 const GLOBAL_TEMPLATE = `# Memori global

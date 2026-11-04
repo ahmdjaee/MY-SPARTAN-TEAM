@@ -42,6 +42,8 @@ export const DENY_ALWAYS = [
   // Catatan pribadi pemilik produk: ada di folder tugas yang boleh dibaca agen,
   // jadi larangannya harus eksplisit.
   `Read(${abs(`${CONFIG.tasksDir}/**/notes.md`)})`,
+  `Write(${abs(`${CONFIG.tasksDir}/**/notes.md`)})`,
+  `Edit(${abs(`${CONFIG.tasksDir}/**/notes.md`)})`,
 ];
 
 export const ROLES: Record<RoleId, RoleDef> = {
@@ -118,7 +120,7 @@ export const ROLES: Record<RoleId, RoleDef> = {
     disallowedTools: [],
     persona: persona("engineer"),
     usesBrowser: false,
-    producesReport: false,
+    producesReport: true,
   },
   devops: {
     id: "devops",
@@ -171,6 +173,10 @@ export const ROLES: Record<RoleId, RoleDef> = {
         "Bash(nginx -t:*)",
         "Bash(git status:*)",
         "Bash(git log:*)",
+        // Laporan tugas: tanpa ini setiap penulisan report.md memunculkan kartu persetujuan.
+        // Sengaja hanya folder tugas — kode dan konfigurasi server tetap butuh persetujuan.
+        `Write(${abs(`${CONFIG.tasksDir}/**`)})`,
+        `Edit(${abs(`${CONFIG.tasksDir}/**`)})`,
       ],
       ask: [],
       deny: ["Bash(rm -rf /:*)", "Bash(chmod -R 777:*)", ...DENY_ALWAYS],
@@ -179,7 +185,7 @@ export const ROLES: Record<RoleId, RoleDef> = {
     disallowedTools: [],
     persona: persona("devops"),
     usesBrowser: false,
-    producesReport: false,
+    producesReport: true,
   },
 };
 

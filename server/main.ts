@@ -3,6 +3,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import express from "express";
 import { askHub } from "./agent/ask.ts";
+import { curator } from "./agent/curator.ts";
 import { scheduler } from "./agent/scheduler.ts";
 import { CONFIG, ensureDirs } from "./config.ts";
 import { closeOrphanRequests } from "./recover.ts";
@@ -28,6 +29,7 @@ loadTasks();
 ensureDefaultProject();
 const adopted = adoptOrphanTasks();
 const orphans = closeOrphanRequests();
+curator.watch();
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const app = express();
@@ -69,11 +71,13 @@ const server = app.listen(CONFIG.port, CONFIG.host, () => {
   console.log(`  model     : qa=${CONFIG.models.qa} engineer=${CONFIG.models.engineer} devops=${CONFIG.models.devops}`);
   const resumed = scheduler.resumePending();
   if (resumed > 0) console.log(`  ${resumed} tugas yang sempat berjalan dilanjutkan`);
+  curator.catchUp();
 });
 
 async function shutdown(signal: string): Promise<void> {
   console.log(`\n${signal} — menutup sesi agen…`);
   askHub.closeAll();
+  curator.closeAll();
   await scheduler.closeAll();
   server.close(() => process.exit(0));
   setTimeout(() => process.exit(0), 3_000).unref();

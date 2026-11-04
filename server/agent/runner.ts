@@ -7,7 +7,7 @@ import {
   type Query,
   type SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
-import { closeBrowserFor, createBrowserServer } from "../browser/mcp.ts";
+import { BrowserSession, closeBrowserFor, createBrowserServer } from "../browser/mcp.ts";
 import { CONFIG, agentEnv } from "../config.ts";
 import { contextBlock, workspaceForTask } from "../context.ts";
 import { ROLES, permissionsFor, resolvePermissionMode } from "../roles.ts";
@@ -78,6 +78,8 @@ export class TaskRunner {
   /** id permintaan yang ditutup paksa — supaya tidak diumumkan dua kali. */
   private readonly cancelled = new Set<string>();
   private warnedFallback = false;
+  /** Satu browser per runner — sesi Claude boleh di-restart setelah idle tanpa meninggalkan Chromium lama. */
+  private browser?: BrowserSession;
 
   constructor(
     readonly taskId: string,
@@ -198,7 +200,10 @@ export class TaskRunner {
     const mcpServers: NonNullable<Options["mcpServers"]> = {
       team: createTeamServer(this.taskId),
     };
-    if (role.usesBrowser) mcpServers.browser = createBrowserServer(() => this.taskId);
+    if (role.usesBrowser) {
+      this.browser ??= new BrowserSession(() => this.taskId);
+      mcpServers.browser = createBrowserServer(this.browser, () => this.taskId);
+    }
 
     return {
       systemPrompt: {
@@ -307,6 +312,8 @@ export class TaskRunner {
       // proses mungkin sudah mati
     }
     this.q = undefined;
+    // Chromium ikut ditutup; saat dilanjutkan agen cukup memanggil open() lagi.
+    void this.browser?.close().catch(() => undefined);
   }
 
   // ---------- kendali ----------
@@ -330,6 +337,7 @@ export class TaskRunner {
     // Browser QA hidup di proses kita sendiri; kalau agen tidak sempat memanggil
     // browser.close, proses Chromium-nya akan tertinggal.
     await closeBrowserFor(this.taskId);
+    await this.browser?.close().catch(() => undefined);
     this.freeSlot();
     this.busy = false;
   }
@@ -425,8 +433,10 @@ export class TaskRunner {
     this.pending.delete(id);
 
     if (this.closed || this.cancelled.has(id)) return value;
+    // Keputusan sudah diambil; kalau slot penuh, tugas mengantre — bukan "butuh Anda" lagi.
+    if (this.status === "waiting") this.setStatus("starting");
     this.release = await this.hooks.acquire(this.role);
-    if (this.status === "waiting") this.setStatus("working");
+    if (this.status === "starting") this.setStatus("working");
     return value;
   }
 

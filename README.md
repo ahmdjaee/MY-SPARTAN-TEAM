@@ -4,7 +4,7 @@ Aplikasi pribadi untuk menugaskan pekerjaan nyata ke tiga rekan kerja AI senior.
 
 | Bot | Yang dia kerjakan | Hasil yang Anda baca |
 |---|---|---|
-| **QA Engineer** | Menguji lewat Chromium (buka, klik, isi form, baca console) | tab **Live** untuk menonton langsung · `report.md` + screenshot bukti di tab **Laporan** |
+| **QA Engineer** | Menguji lewat Chromium (buka, klik, isi form, unggah berkas, baca console) | tab **Live** untuk menonton langsung · `report.md` + screenshot bukti di tab **Laporan** |
 | **Software Engineer** | Mengubah kode di `WORKSPACE_DIR`, menjalankan test | Transcript + tab **Perubahan** (git status & diff) |
 | **DevOps Engineer** | Inspeksi server, rencana + rollback, eksekusi setelah Anda setujui | Transcript + kartu persetujuan per perintah |
 
@@ -24,6 +24,23 @@ npm run build && npm start   # http://127.0.0.1:4320
 
 Pengembangan UI (hot reload di 4321, API tetap 4320): `npm run dev`.
 Pindahkan laporan dari versi lama (kalau ada `data/reports/`): `npm run migrate:v1`.
+
+### Alias domain lokal (`http://ai-team.local`)
+
+Supaya tidak mengetik `127.0.0.1:4320`: nginx yang sudah ada di port 80 meneruskan nama `ai-team.local`
+ke server aplikasi. Berkas vhost-nya ada di `deploy/nginx/ai-team.local.conf` (buffering dimatikan supaya
+SSE dan Live MJPEG tidak tertahan). Pasang sekali:
+
+```bash
+echo "127.0.0.1 ai-team.local" | sudo tee -a /etc/hosts
+sudo cp deploy/nginx/ai-team.local.conf /etc/nginx/sites-available/ai-team.local
+sudo ln -s /etc/nginx/sites-available/ai-team.local /etc/nginx/sites-enabled/ai-team.local
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+`127.0.0.1:4320` tetap bisa dipakai; `ai-team.service` tidak perlu di-restart. Alias ini hanya untuk
+build produksi — UI dev `npm run dev` tetap di port Vite 4321. `/etc/hosts` dibaca lebih dulu daripada
+mDNS (`nsswitch: files mdns4_minimal`), jadi akhiran `.local` aman walau Avahi aktif.
 
 ### Auto-start (systemd user service)
 
@@ -62,7 +79,7 @@ otomatis saat start berikutnya. Kalau ingin hidup sejak boot tanpa login: `login
 2. Maksimal `MAX_CONCURRENT_AGENTS` tugas berjalan bersamaan (default 2). Tugas **Engineer/DevOps** saling menunggu hanya kalau **workspace-nya sama** — dua project dengan folder berbeda boleh menulis bersamaan; tugas QA selalu boleh paralel.
 3. Saat bot minta izin menjalankan sesuatu, muncul **kartu persetujuan**: *Izinkan*, *Izinkan & ingat*, atau *Tolak* dengan alasan. Agen berhenti sampai Anda memutuskan, dan alasan penolakan dibacanya.
 4. Setelah selesai, status jadi **perlu dibaca**. Buka tab **Laporan** (QA) atau **Perubahan** (kode), lalu **Review**: *Setuju* menutup tugas; *Perlu perbaikan* mengirim komentar Anda ke bot yang sama dan tugas kembali dikerjakan.
-   - Tab **Laporan** berisi `report.md` plus galeri bukti screenshot. Berkas teks lain yang ditulis agen ke folder tugas — laporan tambahan `.md`, bukti data `.tsv`/`.txt`, patch, skrip uji — tampil di tab **Lampiran**: daftar berkas di kiri, isinya dirender di kanan (`.md` sebagai markdown, sisanya apa adanya), dengan tombol **Unduh** per berkas. Tidak perlu lagi membuka `data/tasks/` dari terminal.
+   - Tab **Laporan** berisi `report.md` plus galeri bukti screenshot. Berkas teks lain yang ditulis agen ke folder tugas — laporan tambahan `.md`, bukti data `.tsv`/`.txt`, patch, skrip uji, berkas uji unggahan di `uploads/` — tampil di tab **Lampiran**: daftar berkas di kiri, isinya dirender di kanan (`.md` sebagai markdown, sisanya apa adanya), dengan tombol **Unduh** per berkas. Tidak perlu lagi membuka `data/tasks/` dari terminal.
 5. Tab **Kerja** hanya ikut turun kalau Anda memang sedang berada di dasar. Begitu Anda scroll ke atas untuk membaca chat lama, tampilan diam walau agen terus menulis; yang muncul cuma tombol **Pesan baru ↓** (berubah kuning jadi **Menunggu keputusan Anda ↓** kalau ada kartu persetujuan). Kembali ke dasar — lewat tombol itu atau scroll sendiri — membuatnya mengikuti lagi.
 6. **Oper ke…** memindahkan tugas ke bot lain. Bot baru menerima instruksi asli, **ringkasan serah terima** bot sebelumnya, catatan operan Anda, dan daftar bukti yang sudah ada. Riwayatnya tampil sebagai `QA → Engineer → QA`.
 7. Bot bisa **mengusulkan** operan sendiri (`suggest_handoff`); usulan muncul sebagai tombol satu-klik, tidak pernah jalan tanpa Anda.
@@ -220,7 +237,7 @@ Aturan per bot ada di `server/roles.ts`, persona di `server/prompts/*.md`. Kedua
 data/tasks/T-012/task.json     judul, bot, status, riwayat penugasan, biaya, review
 data/tasks/T-012/thread.jsonl  transcript yang ditampilkan di UI
 data/tasks/T-012/assets/*.png  bukti screenshot
-data/tasks/T-012/report.md     laporan QA (tab Laporan)
+data/tasks/T-012/report.md     laporan tugas, ditulis bot yang mengerjakannya (tab Laporan)
 data/tasks/T-012/notes.md      catatan pribadi Anda (tab Catatan; tidak dibaca bot)
                                (panel Tanya tidak menulis berkas apa pun — hidup di memori)
 data/tasks/T-012/*.md, bukti/*  berkas lain yang ditulis agen (tab Lampiran)

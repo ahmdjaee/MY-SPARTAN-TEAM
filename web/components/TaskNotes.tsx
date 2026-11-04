@@ -18,9 +18,14 @@ export function TaskNotes({ taskId, onSaved }: { taskId: string; onSaved: () => 
   const view: EditorView = isEditorView(viewFromUrl) ? viewFromUrl : "write";
   /** Teks terakhir yang sudah sampai ke server; dibandingkan saat menyimpan otomatis. */
   const pending = useRef<{ taskId: string; saved: string; draft: string }>({ taskId, saved: "", draft: "" });
+  // onSaved milik render terbaru — cleanup effect di bawah tidak boleh memakai versi render pertama.
+  const onSavedRef = useRef(onSaved);
+  onSavedRef.current = onSaved;
 
   useEffect(() => {
     let active = true;
+    // Pindah tugas: draf tugas sebelumnya disimpan dulu sebelum ref-nya ditimpa.
+    if (pending.current.taskId !== taskId) flush(true);
     setText(undefined);
     void api.taskNotes(taskId).then((data) => {
       if (!active) return;
@@ -43,7 +48,7 @@ export function TaskNotes({ taskId, onSaved }: { taskId: string; onSaved: () => 
       body: JSON.stringify({ text: draft }),
       keepalive,
     })
-      .then(() => onSaved())
+      .then(() => onSavedRef.current())
       .catch(() => undefined);
   };
 

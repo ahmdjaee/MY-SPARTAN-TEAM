@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { memo, useMemo, useState } from "react";
 import { api, type UiEvent } from "../api.ts";
 
 type Approval = Extract<UiEvent, { type: "approval" }>;
@@ -137,7 +137,8 @@ export function QuestionCard({ event }: { event: Question }) {
   );
 }
 
-export function ToolCall({
+/** Ribuan baris tool di satu thread: hanya render ulang kalau event/hasilnya memang berubah. */
+export const ToolCall = memo(function ToolCall({
   name,
   input,
   result,
@@ -149,7 +150,7 @@ export function ToolCall({
   const [open, setOpen] = useState(false);
   // mcp__browser__screenshot → browser.screenshot
   const label = name.replace(/^mcp__([^_]+(?:_[^_]+)*)__/, (_match, server: string) => `${server}.`);
-  const summary = commandOf(input).split("\n")[0]?.slice(0, 110) ?? "";
+  const summary = useMemo(() => commandOf(input).split("\n")[0]?.slice(0, 110) ?? "", [input]);
   const state = !result ? "berjalan" : result.isError ? "gagal" : "selesai";
   const tone = !result ? "text-tag-blue-ink" : result.isError ? "text-tag-red-ink" : "text-muted";
 
@@ -172,4 +173,4 @@ export function ToolCall({
       )}
     </div>
   );
-}
+});

@@ -3,8 +3,42 @@ import type { Settings } from "../server/settings.ts";
 import type { Assignment, Review, Task, TaskStatus, TaskSummary } from "../server/tasks.ts";
 import type { Project } from "../server/projects.ts";
 import type { AskMessage } from "../server/agent/ask.ts";
+import type {
+  ProjectRecap,
+  RecapEntry,
+  RecapFinding,
+  RecapSeverity,
+  RecapTone,
+  RecapTotals,
+  RecapVerdict,
+} from "../server/recap.ts";
 
 export type { AskMessage, Assignment, AttentionEvent, AutonomyMode, Project, RoleId, Review, Settings, StoredEvent, Task, TaskStatus, TaskSummary, UiEvent, WorkerStatus };
+export type { ProjectRecap, RecapEntry, RecapFinding, RecapSeverity, RecapTone, RecapTotals, RecapVerdict };
+export type { CoverageCell, CoverageState, Finding, FindingSeverity, FindingStatus, UnlinkedFinding } from "../server/findings.ts";
+export type { CuratorStatus } from "../server/agent/curator.ts";
+
+export type CurationLogItem = {
+  at: string;
+  by: string;
+  action: string;
+  target?: string;
+  detail: string;
+  revertible: boolean;
+};
+
+export type ProjectReport = {
+  projectId: string;
+  generatedAt: string;
+  state: string;
+  findings: import("../server/findings.ts").Finding[];
+  unlinked: import("../server/findings.ts").UnlinkedFinding[];
+  counts: Record<string, number>;
+  coverage: import("../server/findings.ts").CoverageCell[];
+  curator: import("../server/agent/curator.ts").CuratorStatus;
+  log: CurationLogItem[];
+  recap: ProjectRecap;
+};
 
 /** Project + angka ringkas untuk pemilih sidebar dan halaman Project. */
 export type ProjectInfo = Project & {
@@ -42,6 +76,8 @@ export type TaskDetail = {
   task: Task;
   project?: { id: string; name: string; workspaceDir: string };
   events: StoredEvent[];
+  /** Masih ada event lebih lama di server daripada jendela yang dikirim. */
+  eventsHasMore?: boolean;
   openRequests: UiEvent[];
   runnerStatus: WorkerStatus;
   assets: string[];
@@ -88,7 +124,18 @@ export const api = {
     const query = params.toString();
     return request<{ tasks: TaskListItem[]; slots: Slots }>(`/api/tasks${query ? `?${query}` : ""}`);
   },
-  task: (id: string) => request<TaskDetail>(`/api/tasks/${id}`),
+  /** `events` membatasi jendela transcript; `before` mengambil yang lebih lama dari seq itu. */
+  task: (id: string, opts?: { events?: number; before?: number }) => {
+    const params = new URLSearchParams();
+    if (opts?.events !== undefined) params.set("events", String(opts.events));
+    if (opts?.before !== undefined) params.set("before", String(opts.before));
+    const query = params.toString();
+    return request<TaskDetail>(`/api/tasks/${id}${query ? `?${query}` : ""}`);
+  },
+  /** Detail tanpa transcript — untuk menyegarkan header/tab tanpa menarik ribuan event. */
+  taskMeta: (id: string) => request<TaskDetail>(`/api/tasks/${id}?events=0`),
+  /** Hanya teks report.md — jauh lebih ringan daripada api.task() untuk menampilkan laporan. */
+  taskReport: (id: string) => request<{ text: string | null }>(`/api/tasks/${id}/report`),
   taskDoc: (id: string, path: string) => request<DocContent>(docUrl(id, path)),
   liveStatus: (id: string) => request<LiveState>(`/api/tasks/${id}/live/status`),
   taskNotes: (id: string) => request<{ text: string }>(`/api/tasks/${id}/notes`),
@@ -130,6 +177,21 @@ export const api = {
 
   projects: () => request<{ projects: ProjectInfo[] }>("/api/projects"),
   project: (id: string) => request<ProjectDetail>(`/api/projects/${encodeURIComponent(id)}`),
+  projectRecap: (id: string) => request<ProjectRecap>(`/api/projects/${encodeURIComponent(id)}/recap`),
+  projectReport: (id: string) => request<ProjectReport>(`/api/projects/${encodeURIComponent(id)}/report`),
+  projectReportMarkdownUrl: (id: string) => `/api/projects/${encodeURIComponent(id)}/report.md`,
+  projectFindingsMarkdownUrl: (id: string) => `/api/projects/${encodeURIComponent(id)}/findings.md`,
+  curate: (id: string) => request<{ ok: true }>(`/api/projects/${encodeURIComponent(id)}/curate`, { method: "POST" }),
+  patchFinding: (id: string, fid: string, body: { status?: string; note?: string; verified?: boolean; mergeInto?: string }) =>
+    request<{ ok: true }>(`/api/projects/${encodeURIComponent(id)}/findings/${encodeURIComponent(fid)}`, {
+      method: "PATCH",
+      body: JSON.stringify(body),
+    }),
+  revertCuration: (id: string, entry: { at: string; action?: string; target?: string }) =>
+    request<{ ok: true; detail: string }>(`/api/projects/${encodeURIComponent(id)}/curation-log/revert`, {
+      method: "POST",
+      body: JSON.stringify(entry),
+    }),
   createProject: (body: { name: string; targetUrl?: string; workspaceDir?: string }) =>
     request<{ project: ProjectInfo }>("/api/projects", { method: "POST", body: JSON.stringify(body) }),
   patchProject: (id: string, patch: { name?: string; targetUrl?: string; workspaceDir?: string; archived?: boolean }) =>
@@ -164,6 +226,8 @@ export const api = {
       `/api/workspace/diff${projectId ? `?project=${encodeURIComponent(projectId)}` : ""}`,
     ),
 };
+
+export const ROLE_SHORT: Record<RoleId, string> = { qa: "QA", engineer: "Engineer", devops: "DevOps" };
 
 export const STATUS_LABEL: Record<TaskStatus, string> = {
   queued: "antre",

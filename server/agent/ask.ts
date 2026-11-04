@@ -31,9 +31,9 @@ const READ_TOOLS = ["Read", "Grep", "Glob"];
 
 /** Panel ini hanya membaca; apa pun yang bisa mengubah sesuatu ditolak diam-diam. */
 export function askOptions(taskId: string, model: string, history: AskMessage[]): Options {
-  const denyTool: CanUseTool = async (toolName) =>
+  const denyTool: CanUseTool = async (toolName, input) =>
     READ_TOOLS.includes(toolName)
-      ? { behavior: "allow", updatedInput: {} }
+      ? { behavior: "allow", updatedInput: input }
       : { behavior: "deny", message: `Panel Tanya hanya boleh membaca (${READ_TOOLS.join(", ")}).` };
 
   return {

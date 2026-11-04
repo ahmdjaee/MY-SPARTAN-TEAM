@@ -1,7 +1,8 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   MODE_LABEL,
   MODE_NOTE,
+  ROLE_SHORT,
   STATUS_LABEL,
   STATUS_STYLE,
   api,
@@ -21,7 +22,6 @@ import { LiveView } from "./LiveView.tsx";
 import { TaskNotes } from "./TaskNotes.tsx";
 import { TaskThread } from "./TaskThread.tsx";
 
-const ROLE_SHORT: Record<RoleId, string> = { qa: "QA", engineer: "Engineer", devops: "DevOps" };
 const ASK_KEY = "ai-team-ask";
 
 function HandoffDialog({
@@ -183,6 +183,8 @@ export function TaskDetail({
 }) {
   const [handoff, setHandoff] = useState<{ role: RoleId; note: string } | true | undefined>();
   const [review, setReview] = useState(false);
+  // Usul agen dibiarkan tertutup: catatannya sering panjang dan header tidak ikut ter-scroll.
+  const [suggestOpen, setSuggestOpen] = useState(false);
   // undefined = judul sedang tidak disunting.
   const [titleDraft, setTitleDraft] = useState<string | undefined>(undefined);
   const autoOpened = useRef<string | undefined>(undefined);
@@ -216,10 +218,21 @@ export function TaskDetail({
       // localStorage bisa diblokir; abaikan
     }
   }, [asking]);
-  const { detail, events, status, streaming, error } = useTaskThread(taskId, refreshKey);
+  const { detail, events, status, streaming, error, disconnected, hasMore, loadingOlder, loadOlder } = useTaskThread(
+    taskId,
+    refreshKey,
+  );
+  // report.md bisa 50 KB; parse-nya sekali per isi, bukan tiap render header.
+  const reportHtml = useMemo(
+    () => (detail?.report ? renderMarkdown(detail.report, taskId) : ""),
+    [detail?.report, taskId],
+  );
 
   // Pindah tugas tidak boleh meninggalkan nama tugas sebelumnya di kotak sunting.
   useEffect(() => setTitleDraft(undefined), [taskId]);
+
+  // Usul yang baru ditulis agen tidak boleh muncul dalam keadaan terbentang.
+  useEffect(() => setSuggestOpen(false), [taskId, detail?.task.suggestedNext?.at]);
 
   // Tugas yang browsernya sedang hidup langsung membuka tab Live — sekali saja, dan
   // hanya kalau alamatnya belum menyebut tab (tautan dalam tidak boleh dibajak).
@@ -364,16 +377,36 @@ export function TaskDetail({
         )}
 
         {task.suggestedNext && (
-          <div className="mt-2 flex items-center gap-2 rounded-lg border border-line bg-tag-orange px-3 py-2 text-xs text-tag-orange-ink">
-            <span>
-              Usul agen: lanjutkan ke <strong>{ROLE_SHORT[task.suggestedNext.role]}</strong> — {task.suggestedNext.note}
-            </span>
-            <button
-              onClick={() => setHandoff({ role: task.suggestedNext!.role, note: task.suggestedNext!.note })}
-              className="ml-auto rounded border border-line-strong px-2 py-0.5 hover:bg-hover"
-            >
-              Oper sekarang
-            </button>
+          <div className="mt-2 rounded-lg border border-line bg-tag-orange px-3 py-1.5 text-xs text-tag-orange-ink">
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                aria-expanded={suggestOpen}
+                onClick={() => setSuggestOpen((value) => !value)}
+                title={suggestOpen ? "Tutup usul agen" : "Baca usul agen selengkapnya"}
+                className="flex min-w-0 flex-1 items-center gap-1.5 rounded text-left hover:opacity-80"
+              >
+                <span aria-hidden className="shrink-0">
+                  {suggestOpen ? "▾" : "▸"}
+                </span>
+                <span className="truncate">
+                  Usul agen: lanjutkan ke <strong>{ROLE_SHORT[task.suggestedNext.role]}</strong>
+                  {suggestOpen ? null : ` — ${task.suggestedNext.note}`}
+                </span>
+              </button>
+              <button
+                onClick={() => setHandoff({ role: task.suggestedNext!.role, note: task.suggestedNext!.note })}
+                className="shrink-0 rounded border border-line-strong px-2 py-0.5 hover:bg-hover"
+              >
+                Oper sekarang
+              </button>
+            </div>
+            {/* Dibatasi tingginya: catatan agen bisa ribuan karakter dan header tidak ikut ter-scroll. */}
+            {suggestOpen && (
+              <p className="mt-1.5 max-h-56 overflow-y-auto break-words whitespace-pre-wrap">
+                {task.suggestedNext.note}
+              </p>
+            )}
           </div>
         )}
 
@@ -427,6 +460,10 @@ export function TaskDetail({
             streaming={streaming}
             error={error}
             canSend={task.status !== "cancelled"}
+            disconnected={disconnected}
+            hasMore={hasMore}
+            loadingOlder={loadingOlder}
+            onLoadOlder={loadOlder}
           />
         )}
 
@@ -435,7 +472,7 @@ export function TaskDetail({
         {tab === "report" && (
           <div className="h-full overflow-y-auto px-6 py-5">
             {detail.report ? (
-              <div className="markdown" dangerouslySetInnerHTML={{ __html: renderMarkdown(detail.report, task.id) }} />
+              <div className="markdown" dangerouslySetInnerHTML={{ __html: reportHtml }} />
             ) : (
               <p className="rounded-lg border border-line bg-panel p-3 text-sm text-muted">
                 Belum ada `report.md` untuk tugas ini.
@@ -449,7 +486,7 @@ export function TaskDetail({
                     const url = `/api/tasks/${encodeURIComponent(task.id)}/assets/${encodeURIComponent(asset)}`;
                     return (
                       <a key={asset} href={url} target="_blank" rel="noreferrer" className="block overflow-hidden rounded-lg border border-line">
-                        <img src={url} alt={asset} className="h-32 w-full object-cover object-top" />
+                        <img src={url} alt={asset} loading="lazy" className="h-32 w-full object-cover object-top" />
                         <p className="truncate px-2 py-1 font-mono text-[11px] text-muted">{asset}</p>
                       </a>
                     );

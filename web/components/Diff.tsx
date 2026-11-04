@@ -6,8 +6,15 @@ export function Diff({ projectId }: { projectId?: string }) {
   const [tick, setTick] = useState(0);
 
   useEffect(() => {
+    let active = true;
     setData(undefined);
-    void api.diff(projectId).then(setData);
+    void api
+      .diff(projectId)
+      .then((next) => active && setData(next))
+      .catch(() => undefined);
+    return () => {
+      active = false;
+    };
   }, [tick, projectId]);
 
   if (!data) return <p className="p-6 text-sm text-faint">Memuat…</p>;

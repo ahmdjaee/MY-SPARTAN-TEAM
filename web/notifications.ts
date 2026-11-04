@@ -17,8 +17,15 @@ export async function requestPermission(): Promise<NotificationPermission | "uns
   return await Notification.requestPermission();
 }
 
-/** Satu aliran untuk seluruh aplikasi, supaya notifikasi tetap jalan di tugas mana pun. */
-export function startAttentionStream(onEvent: (event: AttentionEvent) => void): () => void {
+/**
+ * Satu aliran untuk seluruh aplikasi, supaya notifikasi tetap jalan di tugas mana pun.
+ * `onTasksChanged` dipanggil saat server menandai daftar tugas berubah (dan saat
+ * sambungan terbuka/pulih), menggantikan polling daftar yang rapat.
+ */
+export function startAttentionStream(
+  onEvent: (event: AttentionEvent) => void,
+  onTasksChanged?: () => void,
+): () => void {
   const source = new EventSource("/api/events");
   source.onmessage = (message) => {
     try {
@@ -27,6 +34,8 @@ export function startAttentionStream(onEvent: (event: AttentionEvent) => void): 
       // event rusak dilewati
     }
   };
+  source.addEventListener("tasks_changed", () => onTasksChanged?.());
+  source.onopen = () => onTasksChanged?.();
   return () => source.close();
 }
 

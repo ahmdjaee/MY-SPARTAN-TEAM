@@ -1,26 +1,52 @@
+import { existsSync } from "node:fs";
 import { projectOfTask, workspaceForTask } from "./context.ts";
 import { ROLES } from "./roles.ts";
-import { listAssets, reportPath, taskDir, type Assignment, type Task } from "./tasks.ts";
+import { assetsDir, listAssets, reportPath, taskDir, type Assignment, type Task } from "./tasks.ts";
 
 const CLOSING = [
   "",
   "Tutup pekerjaan dengan bagian `## Ringkasan serah terima` berisi: apa yang Anda kerjakan,",
   "hasil atau temuan utama, apa yang belum selesai, dan apa yang perlu dilakukan berikutnya.",
   "Bagian itu dibaca pemilik produk dan bot berikutnya kalau tugas ini dioper.",
+  "Ringkasan itu pendek dan ada di chat; detail lengkapnya tetap di report.md, bukan diulang di sini.",
 ].join("\n");
+
+/**
+ * Instruksi laporan untuk satu tugas.
+ *
+ * Satu tugas = satu folder = satu `report.md`. Jadi role kedua dan seterusnya
+ * MENAMBAH bagiannya sendiri, tidak menimpa laporan role sebelumnya.
+ * Dipisah jadi fungsi sendiri supaya bisa diuji gate tanpa menjalankan agen.
+ */
+export function reportInstruction(task: Task): string {
+  if (!ROLES[task.role].producesReport) {
+    return "Kalau Anda perlu menyimpan artefak (log, catatan, patch), taruh di run_dir.";
+  }
+  const path = reportPath(task.id);
+  if (existsSync(path)) {
+    return [
+      `Laporan tugas ini sudah ada di ${path} — ditulis bot sebelumnya.`,
+      `TAMBAHKAN bagian Anda di akhir berkas itu, dengan heading \`## <Bagian> — ${ROLES[task.role].title} · <tanggal>\`.`,
+      "Jangan mengubah, memotong, atau menghapus bagian yang sudah ada di sana.",
+    ].join("\n");
+  }
+  return `Tulis laporan akhir ke ${path}, ikuti template "Format report.md" di instruksi peran Anda.`;
+}
 
 function workspaceBlock(task: Task): string {
   const project = projectOfTask(task.id);
   const lines: string[] = [];
   if (project) lines.push(`project: ${project.name}`);
   lines.push(`workspace: ${workspaceForTask(task.id)}`, `run_dir: ${taskDir(task.id)}`);
+  lines.push(reportInstruction(task));
   if (ROLES[task.role].producesReport) {
+    lines.push("Artefak lain (log, catatan kerja, patch) taruh juga di run_dir — isinya tampil di tab Lampiran.");
+  }
+  // Hanya role berbrowser yang punya folder bukti; menyebutnya ke role lain cuma menyesatkan.
+  if (ROLES[task.role].usesBrowser) {
     lines.push(
-      `Tulis laporan akhir ke ${taskDir(task.id)}/report.md. Screenshot dari tool browser otomatis tersimpan di`,
-      `${taskDir(task.id)}/assets/ — rujuk dengan path relatif ./assets/<nama>.png.`,
+      `Screenshot dari tool browser otomatis tersimpan di ${assetsDir(task.id)} — rujuk dengan path relatif ./assets/<nama>.png.`,
     );
-  } else {
-    lines.push(`Kalau Anda perlu menyimpan artefak (log, catatan, patch), taruh di folder itu.`);
   }
   const target = task.targetUrl || project?.targetUrl;
   if (target) lines.push(`target: ${target}`);

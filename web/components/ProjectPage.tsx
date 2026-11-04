@@ -1,22 +1,23 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import {
+  ROLE_SHORT,
   STATUS_LABEL,
   STATUS_STYLE,
   api,
   type ProjectDetail,
   type ProjectInfo,
-  type RoleId,
   type TaskSummary,
 } from "../api.ts";
 import { taskPath } from "../routes.tsx";
 import { MarkdownEditor, isEditorView, type EditorView } from "./MarkdownEditor.tsx";
+import { ProjectReport } from "./ProjectReport.tsx";
 
-const ROLE_SHORT: Record<RoleId, string> = { qa: "QA", engineer: "Engineer", devops: "DevOps" };
 const TABS = [
   ["context", "Konteks"],
   ["memory", "Memori project"],
   ["tasks", "Tugas"],
+  ["recap", "Report"],
   ["settings", "Setelan"],
 ] as const;
 type PageTab = (typeof TABS)[number][0];
@@ -194,14 +195,18 @@ export function ProjectPage({
   const viewFromUrl = search.get("view");
   const view: EditorView = isEditorView(viewFromUrl) ? viewFromUrl : "write";
 
+  const currentProject = useRef(projectId);
+  currentProject.current = projectId;
+
   const load = () => {
     void api
       .project(projectId)
       .then((data) => {
+        if (currentProject.current !== projectId) return;
         setDetail(data);
         setError(undefined);
       })
-      .catch((cause: Error) => setError(cause.message));
+      .catch((cause: Error) => currentProject.current === projectId && setError(cause.message));
   };
 
   useEffect(() => {
@@ -241,6 +246,8 @@ export function ProjectPage({
   }
   if (!detail) return <p className="p-6 text-sm text-faint">Memuat project…</p>;
   const { project } = detail;
+  // Angka di label tab Rekap datang dari data yang sudah ada — tanpa request tambahan.
+  const reportCount = detail.tasks.filter((task) => task.hasReport).length;
 
   const saveName = () => {
     const next = nameDraft?.trim() ?? "";
@@ -301,6 +308,7 @@ export function ProjectPage({
             >
               {label}
               {value === "tasks" && project.taskCount > 0 ? ` (${project.taskCount})` : ""}
+              {value === "recap" && reportCount > 0 ? ` (${reportCount})` : ""}
             </button>
           ))}
         </nav>
@@ -324,7 +332,7 @@ export function ProjectPage({
               value={detail.memory}
               view={view}
               onView={setView}
-              note="Ditulis bot lewat tool `remember`. Boleh Anda rapikan; isinya ikut dibaca setiap tugas di project ini."
+              note="Bagian Catatan tim dirapikan otomatis oleh kurator dari catatan `remember` bot; bagian lain milik Anda. Isinya ikut dibaca setiap tugas di project ini."
               onSave={async (text) => (await api.saveProjectMemory(project.id, text)).text}
             />
           </div>
@@ -338,6 +346,7 @@ export function ProjectPage({
             onChanged={refresh}
           />
         )}
+        {tab === "recap" && <ProjectReport projectId={project.id} search={search} />}
         {tab === "settings" && <Settings project={project} projects={projects} onChanged={refresh} />}
       </div>
     </div>

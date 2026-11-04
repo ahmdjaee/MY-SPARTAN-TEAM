@@ -31,6 +31,8 @@ class LiveHub {
     if (now - (this.lastPublish.get(taskId) ?? 0) < THROTTLE_MS) return;
     this.lastPublish.set(taskId, now);
 
+    // Hapus dulu supaya urutan Map (dipakai sebagai LRU) ikut diperbarui.
+    this.frames.delete(taskId);
     this.frames.set(taskId, jpeg);
     this.trimCache(taskId);
     this.setState(taskId, { active: true, lastFrameAt: now });
@@ -39,10 +41,10 @@ class LiveHub {
   }
 
   private trimCache(keep: string): void {
-    while (this.frames.size > MAX_CACHED_FRAMES) {
-      const oldest = this.frames.keys().next().value;
-      if (oldest === undefined || oldest === keep) break;
-      this.frames.delete(oldest);
+    for (const key of this.frames.keys()) {
+      if (this.frames.size <= MAX_CACHED_FRAMES) break;
+      if (key === keep) continue;
+      this.frames.delete(key);
     }
   }
 

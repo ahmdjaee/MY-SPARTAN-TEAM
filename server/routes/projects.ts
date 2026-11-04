@@ -13,6 +13,24 @@ import {
   writeProjectMemory,
   type Project,
 } from "../projects.ts";
+import { buildProjectRecap } from "../recap.ts";
+import { renderFindingsMarkdown, renderReportMarkdown } from "../report-markdown.ts";
+import { curator } from "../agent/curator.ts";
+import {
+  FINDING_STATUSES,
+  canRevert,
+  counts,
+  mergeFinding,
+  readCoverage,
+  readLog,
+  readRegister,
+  readState,
+  revertLog,
+  setFindingStatus,
+  unlinkedFindings,
+  type FindingStatus,
+  type Register,
+} from "../findings.ts";
 import { listTasks } from "../tasks.ts";
 
 export const projectsRouter = Router();
@@ -66,6 +84,165 @@ projectsRouter.get("/projects/:id", (req, res) => {
     memory: readProjectMemory(project.id),
     tasks: listTasks({ project: project.id }),
   });
+});
+
+/**
+ * Rekap project: laporan tiap tugas dipanen ulang dari disk setiap kali dipanggil.
+ * Sengaja tanpa cache — tombol Sync di UI memang berarti "baca ulang berkasnya".
+ */
+projectsRouter.get("/projects/:id/recap", (req, res) => {
+  const project = getProject(req.params.id);
+  if (!project) {
+    res.status(404).json({ error: "project tidak ditemukan" });
+    return;
+  }
+  res.json(buildProjectRecap(project.id, { fresh: true }));
+});
+
+/**
+ * Report utama project: kesimpulan, register temuan, cakupan, status kurator, dan
+ * log kurasi. Rekap per tugas ikut sebagai lampiran.
+ */
+projectsRouter.get("/projects/:id/report", (req, res) => {
+  const project = getProject(req.params.id);
+  if (!project) {
+    res.status(404).json({ error: "project tidak ditemukan" });
+    return;
+  }
+  try {
+    const register = readRegister(project.id);
+    const recap = buildProjectRecap(project.id);
+    res.json({
+      projectId: project.id,
+      generatedAt: new Date().toISOString(),
+      state: readState(project.id),
+      findings: register.findings,
+      unlinked: unlinkedFindings(project.id, register, recap.entries),
+      counts: counts(project.id, register),
+      coverage: readCoverage(project.id),
+      curator: curator.status(project.id),
+      log: readLog(project.id, 40).map((entry) => ({
+        at: entry.at,
+        by: entry.by,
+        action: entry.action,
+        target: entry.target,
+        detail: entry.detail,
+        revertible: canRevert(entry),
+      })),
+      recap,
+    });
+  } catch (error) {
+    // Register rusak tidak boleh diam-diam ditimpa; tampilkan sebabnya ke pemilik produk.
+    res.status(500).json({ error: (error as Error).message });
+  }
+});
+
+/** Route unduhan Markdown: nama berkas `<awalan>-<project>-<tanggal>.md`. */
+function markdownDownload(path: string, prefix: string, render: (project: Project, register: Register) => string): void {
+  projectsRouter.get(path, (req, res) => {
+    const project = getProject(req.params.id as string);
+    if (!project) {
+      res.status(404).json({ error: "project tidak ditemukan" });
+      return;
+    }
+    try {
+      const markdown = render(project, readRegister(project.id));
+      const slug = project.name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+      const safeId = project.id.replace(/[^A-Za-z0-9_-]+/g, "-");
+      // sv-SE memberi YYYY-MM-DD menurut zona waktu server.
+      const date = new Date().toLocaleDateString("sv-SE");
+      res.attachment(`${prefix}-${slug || safeId}-${date}.md`);
+      res.type("text/markdown").send(markdown);
+    } catch (error) {
+      res.status(500).json({ error: (error as Error).message });
+    }
+  });
+}
+
+/** Report lengkap: sama dengan isi tab Report, tanpa log kurasi. */
+markdownDownload("/projects/:id/report.md", "report", (project, register) =>
+  renderReportMarkdown({
+    project,
+    generatedAt: new Date().toISOString(),
+    state: readState(project.id),
+    findings: register.findings,
+    counts: counts(project.id, register),
+    coverage: readCoverage(project.id),
+    recap: buildProjectRecap(project.id),
+  }),
+);
+
+/** Temuan saja: Ringkasan dan register, tanpa kesimpulan, cakupan, lampiran, dan daftar pelapor. */
+markdownDownload("/projects/:id/findings.md", "temuan", (project, register) =>
+  renderFindingsMarkdown({
+    project,
+    generatedAt: new Date().toISOString(),
+    findings: register.findings,
+    counts: counts(project.id, register),
+  }),
+);
+
+/** Sync = jalankan kurator sekarang (tanpa jeda), walaupun tidak ada sumber baru. */
+projectsRouter.post("/projects/:id/curate", (req, res) => {
+  const project = getProject(req.params.id);
+  if (!project) {
+    res.status(404).json({ error: "project tidak ditemukan" });
+    return;
+  }
+  void curator.run(project.id, true);
+  res.json({ ok: true, curator: { ...curator.status(project.id), running: true } });
+});
+
+/** Koreksi pemilik produk atas register: ubah status (wajib alasan untuk penutupan) atau gabungkan duplikat. */
+projectsRouter.patch("/projects/:id/findings/:fid", (req, res) => {
+  const project = getProject(req.params.id);
+  if (!project) {
+    res.status(404).json({ error: "project tidak ditemukan" });
+    return;
+  }
+  try {
+    if (typeof req.body?.mergeInto === "string" && req.body.mergeInto.trim()) {
+      const target = mergeFinding(project.id, req.params.fid, req.body.mergeInto, "owner");
+      res.json({ ok: true, finding: target });
+      return;
+    }
+    const status = req.body?.status as FindingStatus;
+    if (!FINDING_STATUSES.includes(status)) {
+      res.status(400).json({ error: "status tidak dikenal" });
+      return;
+    }
+    const note = typeof req.body?.note === "string" ? req.body.note.trim() : "";
+    const finding = setFindingStatus(project.id, req.params.fid, status, note ? { by: "owner", note } : undefined, "owner", {
+      verified: req.body?.verified === true,
+    });
+    res.json({ ok: true, finding });
+  } catch (error) {
+    res.status(400).json({ error: (error as Error).message });
+  }
+});
+
+projectsRouter.post("/projects/:id/curation-log/revert", (req, res) => {
+  const project = getProject(req.params.id);
+  if (!project || typeof req.body?.at !== "string") {
+    res.status(project ? 400 : 404).json({ error: project ? "at wajib diisi" : "project tidak ditemukan" });
+    return;
+  }
+  try {
+    const detail = revertLog(
+      project.id,
+      req.body.at,
+      "owner",
+      (text) => writeProjectMemory(project.id, text),
+      () => readProjectMemory(project.id),
+      {
+        action: typeof req.body.action === "string" ? req.body.action : undefined,
+        target: typeof req.body.target === "string" ? req.body.target : undefined,
+      },
+    );
+    res.json({ ok: true, detail });
+  } catch (error) {
+    res.status(400).json({ error: (error as Error).message });
+  }
 });
 
 projectsRouter.patch("/projects/:id", (req, res) => {

@@ -2,6 +2,7 @@ import { existsSync, readFileSync, statSync } from "node:fs";
 import { basename, join } from "node:path";
 import { Router } from "express";
 import { bus } from "../agent/bus.ts";
+import { curator } from "../agent/curator.ts";
 import { scheduler } from "../agent/scheduler.ts";
 import { BOUNDARY, live } from "../browser/live.ts";
 import { CONFIG } from "../config.ts";
@@ -18,12 +19,13 @@ import {
   listAssets,
   listDocs,
   listTasks,
+  onTasksChanged,
   readReport,
   resolveDoc,
   updateTask,
   type TaskStatus,
 } from "../tasks.ts";
-import type { AttentionEvent, AutonomyMode, StoredEvent } from "../types.ts";
+import { EPHEMERAL_EVENTS, type AttentionEvent, type AutonomyMode, type StoredEvent } from "../types.ts";
 import { defaultModeFor } from "../settings.ts";
 
 export const tasksRouter = Router();
@@ -83,12 +85,26 @@ tasksRouter.post("/tasks", (req, res) => {
   res.json({ task });
 });
 
+const EVENTS_MAX = 2000;
+
+function positiveInt(raw: unknown): number | undefined {
+  const value = typeof raw === "string" ? Number(raw) : NaN;
+  return Number.isInteger(value) && value >= 0 ? value : undefined;
+}
+
+/**
+ * Detail tugas. `?events=N` membatasi jumlah event (0 = hanya metadata, untuk refresh header
+ * tanpa menarik transcript), `?before=seq` mengambil jendela yang lebih lama.
+ */
 tasksRouter.get("/tasks/:id", (req, res) => {
   const task = getTask(req.params.id);
   if (!task) {
     res.status(404).json({ error: "tugas tidak ditemukan" });
     return;
   }
+  const limit = Math.min(positiveInt(req.query.events) ?? EVENTS_MAX, EVENTS_MAX);
+  const before = positiveInt(req.query.before);
+  const window = threads.window(task.id, { limit, before: before && before > 0 ? before : undefined });
   const runner = scheduler.getRunner(task.id);
   const project = getProject(task.projectId);
   res.json({
@@ -96,7 +112,8 @@ tasksRouter.get("/tasks/:id", (req, res) => {
     project: project
       ? { id: project.id, name: project.name, workspaceDir: workspaceForProject(project.id) }
       : undefined,
-    events: threads.read(task.id),
+    events: window.events,
+    eventsHasMore: window.hasMore,
     openRequests: runner?.openRequests() ?? [],
     runnerStatus: runner?.status ?? "idle",
     assets: listAssets(task.id),
@@ -189,10 +206,22 @@ tasksRouter.get("/events", (req, res) => {
   res.write(": connected\n\n");
 
   const unsubscribe = bus.subscribeAll((event: AttentionEvent) => res.write(`data: ${JSON.stringify(event)}\n\n`));
+  // Daftar tugas berubah → klien memuat ulang daftar, bukan polling tiap 3 detik.
+  // Dinamai `event:` supaya tidak masuk onmessage notifikasi.
+  let pending: NodeJS.Timeout | undefined;
+  const unsubscribeTasks = onTasksChanged(() => {
+    if (pending) return;
+    pending = setTimeout(() => {
+      pending = undefined;
+      res.write("event: tasks_changed\ndata: {}\n\n");
+    }, 300);
+  });
   const ping = setInterval(() => res.write(": ping\n\n"), 15_000);
   req.on("close", () => {
     clearInterval(ping);
+    if (pending) clearTimeout(pending);
     unsubscribe();
+    unsubscribeTasks();
   });
 });
 
@@ -246,12 +275,23 @@ tasksRouter.get("/tasks/:id/events", (req, res) => {
   });
   res.write(": connected\n\n");
 
-  const push = (event: StoredEvent | Record<string, unknown>) => res.write(`data: ${JSON.stringify(event)}\n\n`);
+  // `id:` hanya untuk event yang tersimpan: browser mengirimnya balik sebagai Last-Event-ID
+  // saat menyambung ulang, dan event ephemeral (delta/status) tidak bisa di-replay.
+  const push = (event: StoredEvent | Record<string, unknown>) => {
+    const seq = typeof event.seq === "number" ? event.seq : 0;
+    const persisted = seq > 0 && !EPHEMERAL_EVENTS.has(String(event.type));
+    res.write(`${persisted ? `id: ${seq}\n` : ""}data: ${JSON.stringify(event)}\n\n`);
+  };
   const runner = scheduler.getRunner(task.id);
   push({ type: "status", status: runner?.status ?? "idle", seq: 0, ts: new Date().toISOString(), taskId: task.id });
   for (const request of runner?.openRequests() ?? []) {
     push({ ...request, seq: 0, ts: new Date().toISOString(), taskId: task.id, role: task.role });
   }
+
+  // Replay event yang terlewat sejak `after` (atau Last-Event-ID), lalu langsung berlangganan —
+  // keduanya sinkron berurutan, jadi tidak ada celah maupun duplikat.
+  const after = positiveInt(req.query.after) ?? positiveInt(req.get("last-event-id"));
+  if (after !== undefined) for (const event of threads.readAfter(task.id, after)) push(event);
 
   const unsubscribe = bus.subscribe(task.id, push);
   const ping = setInterval(() => res.write(": ping\n\n"), 15_000);
@@ -322,7 +362,18 @@ tasksRouter.post("/tasks/:id/review", (req, res) => {
   });
 
   if (status === "changes_requested" && sendBack) scheduler.sendReview(task.id, comment);
+  // Tugas yang di-approve masuk report project; kurator menautkannya ke register.
+  if (status === "approved") curator.schedule(task.projectId);
   res.json({ ok: true, task: getTask(task.id) });
+});
+
+/** Hanya teks report.md — dipakai baris rekap project yang dibentang, tanpa ikut menarik transcript. */
+tasksRouter.get("/tasks/:id/report", (req, res) => {
+  if (!getTask(req.params.id)) {
+    res.status(404).json({ error: "tugas tidak ditemukan" });
+    return;
+  }
+  res.json({ text: readReport(req.params.id) ?? null });
 });
 
 /** Teks lampiran dipotong di sini supaya tab tetap enteng kalau agen menulis log besar. */

@@ -6,6 +6,7 @@ import { z } from "zod";
 import { CONFIG } from "../config.ts";
 import { assetsDir } from "../tasks.ts";
 import { live } from "./live.ts";
+import { KINDS, kindFromName, makeTestFile, type TestFileKind } from "./files.ts";
 import { DialogWatcher, formatInspect, formatScroll, inspect, readText, scroll } from "./ops.ts";
 
 type CallResult = Awaited<ReturnType<Parameters<typeof tool>[3]>>;
@@ -24,7 +25,7 @@ export async function closeBrowserFor(taskId: string): Promise<void> {
 }
 
 /** Satu sesi browser per tugas, dipakai ulang antar tool call. */
-class BrowserSession {
+export class BrowserSession {
   private browser?: Browser;
   private page?: Page;
   private cdp?: CDPSession;
@@ -128,14 +129,30 @@ class BrowserSession {
  * `getTaskId` dievaluasi saat tool dipanggil, sehingga screenshot selalu
  * mendarat di folder tugas yang sedang dikerjakan.
  */
-export function createBrowserServer(getTaskId: () => string | undefined) {
-  const session = new BrowserSession(getTaskId);
+export function createBrowserServer(session: BrowserSession, getTaskId: () => string | undefined) {
 
   const shotDir = (): string => {
     const id = getTaskId();
     const dir = id ? assetsDir(id) : join(CONFIG.tasksDir, "_adhoc", "assets");
     mkdirSync(dir, { recursive: true });
     return dir;
+  };
+
+  /** Berkas uji unggahan hidup di run_dir/uploads — ikut tampil di tab Lampiran sebagai bukti. */
+  const uploadDir = (): string => {
+    const id = getTaskId();
+    const dir = id ? join(assetsDir(id), "..", "uploads") : join(CONFIG.tasksDir, "_adhoc", "uploads");
+    mkdirSync(dir, { recursive: true });
+    return resolve(dir);
+  };
+
+  /** Hanya berkas di dalam folder uploads yang boleh diserahkan ke halaman (penutup path traversal). */
+  const resolveUpload = (name: string): string => {
+    const dir = uploadDir();
+    const target = resolve(dir, basename(name));
+    if (!target.startsWith(`${dir}/`)) throw new Error(`${name}: di luar folder uploads`);
+    if (!existsSync(target)) throw new Error(`${name}: tidak ada di ./uploads/ — buat dulu dengan make_file`);
+    return target;
   };
 
   const locate = (page: Page, selector?: string, text?: string) => {
@@ -428,6 +445,99 @@ export function createBrowserServer(getTaskId: () => string | undefined) {
             if (!existsSync(target)) return fail(`tidak ada file ${file} di folder bukti`);
             unlinkSync(target);
             return ok(`Bukti ${file} dihapus. Alasan: ${args.reason}`);
+          } catch (error) {
+            return fail(error instanceof Error ? error.message : String(error));
+          }
+        },
+      ),
+      tool(
+        "make_file",
+        "Buat berkas uji dummy di folder ./uploads/ tugas untuk dipakai `upload`. PNG/JPG/PDF valid, CSV/TXT/JSON berisi contoh, `bin` acak untuk uji tipe tak didukung. " +
+          "`sizeKb` memadatkan berkas ke ukuran itu (uji batas ukuran) tanpa merusak formatnya.",
+        {
+          name: z.string().describe("nama berkas dengan ekstensi, mis. foto.png, data.csv, besar.pdf"),
+          kind: z.enum(KINDS as [TestFileKind, ...TestFileKind[]]).optional().describe("bawaan: dari ekstensi nama"),
+          sizeKb: z.number().int().min(1).max(50_000).optional().describe("ukuran akhir dalam KB"),
+          text: z.string().optional().describe("isi untuk csv/txt/json (bawaan: contoh kecil yang valid)"),
+          width: z.number().int().min(1).max(4096).optional().describe("png/jpg, bawaan 320"),
+          height: z.number().int().min(1).max(4096).optional().describe("png/jpg, bawaan 240"),
+        },
+        async (args) => {
+          try {
+            const kind = args.kind ?? kindFromName(args.name);
+            if (!kind) return fail(`ekstensi ${args.name} tidak dikenal — isi \`kind\` (${KINDS.join("/")})`);
+            const safeName = basename(args.name).replace(/[^a-zA-Z0-9._-]/g, "-").slice(0, 80) || `uji.${kind}`;
+            let jpeg: Buffer | undefined;
+            if (kind === "jpg") {
+              // Node tidak punya encoder JPEG; render halaman polos lewat Chromium.
+              const page = await session.getPage();
+              const scratch = await page.context().newPage();
+              try {
+                await scratch.setViewportSize({ width: args.width ?? 320, height: args.height ?? 240 });
+                await scratch.setContent(
+                  `<body style="margin:0;background:linear-gradient(135deg,#dbeafe,#2383e2);font:20px sans-serif;color:#fff;display:grid;place-items:center">${safeName}</body>`,
+                );
+                jpeg = await scratch.screenshot({ type: "jpeg", quality: 80 });
+              } finally {
+                await scratch.close().catch(() => undefined);
+              }
+            }
+            const { buffer, mime } = makeTestFile({ ...args, name: safeName, kind, jpeg });
+            const file = join(uploadDir(), safeName);
+            writeFileSync(file, buffer);
+            return ok(`Berkas uji dibuat: ./uploads/${safeName} (${buffer.length} byte, ${mime}). Pakai \`upload\` dengan files: ["${safeName}"].`);
+          } catch (error) {
+            return fail(error instanceof Error ? error.message : String(error));
+          }
+        },
+      ),
+      tool(
+        "upload",
+        "Serahkan berkas dari ./uploads/ (buat dulu dengan make_file) ke input file halaman. Beri `selector` <input type=file> (boleh tersembunyi), " +
+          "ATAU `clickSelector`/`clickText` tombol kustom yang membuka dialog pilih berkas. Tanpa keduanya dipakai input file pertama di halaman. `files: []` mengosongkan pilihan.",
+        {
+          files: z.array(z.string()).max(20).describe("nama berkas di ./uploads/"),
+          selector: z.string().optional(),
+          clickSelector: z.string().optional(),
+          clickText: z.string().optional(),
+        },
+        async (args) => {
+          try {
+            const page = session.requirePage();
+            const paths = args.files.map(resolveUpload);
+            const before = session.dialogs.count();
+            let target: string;
+            if (args.clickSelector || args.clickText) {
+              const [chooser] = await Promise.all([
+                page.waitForEvent("filechooser", { timeout: 10_000 }),
+                locate(page, args.clickSelector, args.clickText).click({ timeout: 10_000 }),
+              ]);
+              if (paths.length > 1 && !chooser.isMultiple()) {
+                return fail("input ini hanya menerima satu berkas (tanpa atribut multiple) — kirim satu nama saja");
+              }
+              await chooser.setFiles(paths);
+              target = `dialog pilih berkas dari ${args.clickSelector ?? args.clickText}`;
+            } else {
+              const selector = args.selector ?? 'input[type="file"]';
+              const input = page.locator(selector).first();
+              if ((await input.count()) === 0) {
+                return fail(
+                  args.selector
+                    ? `tidak ada elemen ${selector}`
+                    : "tidak ada <input type=file> di halaman — pakai clickSelector/clickText pada tombol unggahnya",
+                );
+              }
+              await input.setInputFiles(paths, { timeout: 10_000 });
+              target = selector;
+            }
+            // Banyak form langsung mengunggah begitu berkas dipilih; beri waktu requestnya jalan.
+            await page.waitForLoadState("networkidle", { timeout: 3_000 }).catch(() => undefined);
+            const dialogs = session.dialogs.takeSince(before);
+            return ok(
+              `${paths.length === 0 ? "Pilihan berkas dikosongkan" : `Terunggah ke ${target}: ${args.files.join(", ")}`}\nURL sekarang: ${page.url()}${
+                dialogs.length > 0 ? `\nDialog native yang muncul:\n${dialogs.join("\n")}` : ""
+              }`,
+            );
           } catch (error) {
             return fail(error instanceof Error ? error.message : String(error));
           }

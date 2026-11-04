@@ -84,12 +84,27 @@ export function writeNotes(id: string, text: string): string {
 }
 
 export function hasNotes(id: string): boolean {
-  return readNotes(id).trim().length > 0;
+  try {
+    return statSync(notesPath(id)).size > 0;
+  } catch {
+    return false;
+  }
 }
 
 // ---------- indeks dalam memori ----------
 
 const index = new Map<string, Task>();
+
+/** assetCount/hasReport untuk daftar — tugas yang sudah berhenti tidak berubah lagi, jadi cukup dihitung sekali. */
+const summaryCache = new Map<string, { assetCount: number; hasReport: boolean }>();
+
+const tasksListeners = new Set<() => void>();
+
+/** Dipanggil setiap task.json ditulis — dipakai SSE /api/events untuk menyuruh klien memuat ulang daftar. */
+export function onTasksChanged(listener: () => void): () => void {
+  tasksListeners.add(listener);
+  return () => tasksListeners.delete(listener);
+}
 
 function metaPath(id: string): string {
   return join(taskDir(id), "task.json");
@@ -101,6 +116,14 @@ function persist(task: Task): void {
   writeFileSync(tmp, JSON.stringify(task, null, 2));
   renameSync(tmp, metaPath(task.id));
   index.set(task.id, task);
+  summaryCache.delete(task.id);
+  for (const listener of tasksListeners) {
+    try {
+      listener();
+    } catch {
+      // satu penyimak yang error tidak boleh menggagalkan penyimpanan
+    }
+  }
 }
 
 export function loadTasks(): void {
@@ -303,6 +326,18 @@ const RANK: Record<TaskStatus, number> = {
   cancelled: 6,
 };
 
+/** Agen masih menulis ke folder tugas aktif di luar persist(), jadi hanya tugas berhenti yang di-cache. */
+function summaryExtras(task: Task): { assetCount: number; hasReport: boolean } {
+  const active = ACTIVE_STATUSES.includes(task.status);
+  if (!active) {
+    const cached = summaryCache.get(task.id);
+    if (cached) return cached;
+  }
+  const extras = { assetCount: listAssets(task.id).length, hasReport: existsSync(reportPath(task.id)) };
+  if (!active) summaryCache.set(task.id, extras);
+  return extras;
+}
+
 export function listTasks(filter?: { role?: RoleId; status?: TaskStatus; project?: string }): TaskSummary[] {
   return [...index.values()]
     .filter(
@@ -311,11 +346,10 @@ export function listTasks(filter?: { role?: RoleId; status?: TaskStatus; project
         (!filter?.status || task.status === filter.status) &&
         (!filter?.project || task.projectId === filter.project),
     )
-    .map(({ description: _description, ...rest }) => ({
-      ...rest,
-      assetCount: listAssets(rest.id).length,
-      hasReport: existsSync(reportPath(rest.id)),
-    }))
+    .map((task) => {
+      const { description: _description, ...rest } = task;
+      return { ...rest, ...summaryExtras(task) };
+    })
     .sort((a, b) => RANK[a.status] - RANK[b.status] || b.updatedAt.localeCompare(a.updatedAt));
 }
 

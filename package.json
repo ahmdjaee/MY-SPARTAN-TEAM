@@ -15,7 +15,11 @@
     "typecheck": "tsc --noEmit",
     "check:mcp": "tsx scripts/check-mcp.ts",
     "migrate:v1": "tsx scripts/migrate-v1.ts",
-    "check:policy": "tsx scripts/check-policy.ts"
+    "check:policy": "tsx scripts/check-policy.ts",
+    "gate:suggest": "tsx scripts/gates/suggest-collapse.ts",
+    "gate:recap": "tsx scripts/gates/project-recap.ts",
+    "gate:register": "tsx scripts/gates/project-register.ts",
+    "gate:report": "tsx scripts/gates/report-sections.ts"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "0.3.310",

@@ -2,12 +2,12 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, s
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { CONFIG } from "./config.ts";
-import { MEMORY_TEMPLATE, appendBullet, trimMemory } from "./memory.ts";
+import { MEMORY_TEMPLATE, fitMemory, trimMemory } from "./memory.ts";
 
 /**
  * Project = induk tugas. Ia memegang konteks yang dipakai bersama semua tugas di
  * dalamnya: catatan yang Anda tulis sendiri (`context.md`), memori yang ditulis bot
- * lewat tool `remember` (`memory.md`), URL target bawaan, dan folder workspace-nya.
+ * dan dirapikan kurator dari catatan `remember` (`memory.md`), URL target bawaan, dan folder workspace-nya.
  */
 export type Project = {
   id: string;
@@ -172,13 +172,9 @@ export function readProjectMemory(id: string): string {
 }
 
 export function writeProjectMemory(id: string, text: string): string {
-  const trimmed = trimMemory(text);
+  const trimmed = fitMemory(text);
   writeAtomic(memoryPath(id), trimmed);
   return trimmed;
-}
-
-export function appendProjectMemory(id: string, note: string, taskId: string): string {
-  return writeProjectMemory(id, appendBullet(readProjectMemory(id), note, taskId));
 }
 
 // ---------- workspace ----------

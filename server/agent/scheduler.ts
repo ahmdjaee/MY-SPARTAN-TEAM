@@ -4,6 +4,7 @@ import { composeHandoffMessage, composeOpeningMessage, composeReviewMessage } fr
 import { ROLES } from "../roles.ts";
 import { defaultModeFor } from "../settings.ts";
 import {
+  ACTIVE_STATUSES,
   activeTasks,
   addAssignment,
   addCost,
@@ -74,6 +75,11 @@ class Scheduler {
     };
   };
 
+  /** Slot agen untuk pekerjaan di luar tugas (kurator), supaya ikut batas MAX_CONCURRENT_AGENTS. */
+  acquireSlot(): Promise<() => void> {
+    return this.slots.acquire();
+  }
+
   // ---------- runner ----------
 
   private runnerFor(task: Task): TaskRunner {
@@ -88,7 +94,7 @@ class Scheduler {
       },
       onStatus: (taskId, status) => this.onStatus(taskId, status),
       onTurnEnd: (taskId, outcome) => this.onTurnEnd(taskId, outcome),
-      onIdleShutdown: () => undefined,
+      onIdleShutdown: (taskId) => this.onIdleShutdown(taskId),
     }, currentAssignment(task).sessionId, task.mode ?? defaultModeFor(task.role));
 
     this.runners.set(task.id, runner);
@@ -117,6 +123,15 @@ class Scheduler {
       // tinggalkan tugas menggantung di "butuh Anda" selamanya.
       updateTask(taskId, { status: "needs_review" });
     }
+  }
+
+  /** Sesi idle sudah ditutup; tugas yang tidak aktif lagi tidak perlu menahan runner (dan browsernya). */
+  private onIdleShutdown(taskId: string): void {
+    const runner = this.runners.get(taskId);
+    const task = getTask(taskId);
+    if (!runner || !task || ACTIVE_STATUSES.includes(task.status)) return;
+    this.runners.delete(taskId);
+    void runner.close();
   }
 
   private onTurnEnd(
