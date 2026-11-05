@@ -1,6 +1,6 @@
 /**
  * Operasi halaman yang butuh diperiksa di dalam DOM: scroll, inspeksi overflow, baca teks.
- * Dipisah dari `mcp.ts` supaya bisa diuji tanpa menjalankan agen (`npm run check:browser`).
+ * Dipisah dari `mcp.ts` supaya bisa diuji tanpa menjalankan agen (`bun run check:browser`).
  */
 import type { Page } from "playwright";
 

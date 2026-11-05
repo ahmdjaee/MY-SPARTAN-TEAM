@@ -7,7 +7,7 @@
  *  2. Instruksi yang dikirim ke bot: menambah bagian kalau report.md sudah ada,
  *     menulis baru kalau belum.
  *
- * Tanpa browser, tanpa agen, tanpa menulis apa pun:  npm run gate:report
+ * Tanpa browser, tanpa agen, tanpa menulis apa pun:  bun run gate:report
  */
 import { existsSync } from "node:fs";
 import { reportInstruction } from "../../server/messages.ts";

@@ -7,7 +7,7 @@
  *  3. Tampilan: tab Report menampilkan kesimpulan, register, cakupan, baris bisa dibentang,
  *     dan report bisa diunduh sebagai Markdown.
  *
- * Jalankan dengan server yang sedang hidup:  npm run gate:register
+ * Jalankan dengan server yang sedang hidup:  bun run gate:register
  * (Tidak memanggil agen sama sekali.)
  */
 import { readFileSync } from "node:fs";

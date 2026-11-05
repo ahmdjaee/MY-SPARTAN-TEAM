@@ -6,7 +6,7 @@
  *  2. Tampilannya: tiap baris setinggi satu baris, bisa dibentang, dan tombol Sync memindahkan
  *     garis dasar penanda "berubah".
  *
- * Jalankan dengan server yang sedang hidup:  npm run gate:recap
+ * Jalankan dengan server yang sedang hidup:  bun run gate:recap
  * (Tidak memanggil agen sama sekali.)
  */
 import { readFileSync, statSync } from "node:fs";

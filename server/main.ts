@@ -56,7 +56,7 @@ if (existsSync(dist)) {
     res
       .status(200)
       .type("html")
-      .send("<h1>AI Team API aktif</h1><p>UI dev: jalankan <code>npm run dev</code> lalu buka port Vite.</p>");
+      .send("<h1>AI Team API aktif</h1><p>UI dev: jalankan <code>bun run dev</code> lalu buka port Vite.</p>");
   });
 }
 

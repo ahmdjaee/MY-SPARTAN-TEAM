@@ -2,7 +2,7 @@
  * Gate: kotak "Usul agen" di halaman tugas harus setinggi SATU BARIS,
  * bisa dibentang saat diklik, dan tidak pernah lagi merebut layar.
  *
- * Jalankan dengan server yang sedang hidup:  npm run gate:suggest
+ * Jalankan dengan server yang sedang hidup:  bun run gate:suggest
  * (Tidak memanggil agen sama sekali — murni pemeriksaan tampilan.)
  */
 import { readFileSync } from "node:fs";

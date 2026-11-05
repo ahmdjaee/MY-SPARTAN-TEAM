@@ -148,7 +148,7 @@ export function migrateProjects(): string[] {
   return log;
 }
 
-// Dijalankan langsung: tsx scripts/migrate-projects.ts
+// Dijalankan langsung: bun scripts/migrate-projects.ts
 if (process.argv[1]?.endsWith("migrate-projects.ts")) {
   ensureDirs();
   const log = migrateProjects();

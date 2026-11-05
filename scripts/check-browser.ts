@@ -1,5 +1,5 @@
 /**
- * Uji tool browser QA tanpa biaya model: npm run check:browser
+ * Uji tool browser QA tanpa biaya model: bun run check:browser
  *
  * Fixture-nya meniru kasus nyata yang pernah salah dilaporkan sebagai bug —
  * tabel lebar di dalam container `overflow-x: auto` (T-019 temuan R-1) — plus

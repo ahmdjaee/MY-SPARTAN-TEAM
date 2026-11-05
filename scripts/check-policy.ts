@@ -1,4 +1,4 @@
-/** Tabel uji pagar keras. Deterministik, tanpa biaya model: npm run check:policy */
+/** Tabel uji pagar keras. Deterministik, tanpa biaya model: bun run check:policy */
 import { classifyCommand, type PolicyCategory } from "../server/policy.ts";
 
 const ctx = { workspaceDir: "/var/www/ai-team/workspace", taskDir: "/var/www/ai-team/data/tasks/T-001" };

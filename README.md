@@ -14,16 +14,16 @@ Semua bot memakai **sesi login Claude Code yang sudah ada di mesin ini** (`~/.cl
 ## Jalankan
 
 ```bash
-npm install
+bun install
 cp .env.example .env     # sesuaikan WORKSPACE_DIR dan TARGET_URL
-npm run check:auth       # bukti sesi login terpakai (apiKeySource: none)
-npm run check:browser    # bukti Playwright + Chromium siap
-npm run check:mcp        # bukti tool browser & tim terdaftar
-npm run build && npm start   # http://127.0.0.1:4320
+bun run check:auth       # bukti sesi login terpakai (apiKeySource: none)
+bun run check:browser    # bukti Playwright + Chromium siap
+bun run check:mcp        # bukti tool browser & tim terdaftar
+bun run start   # http://127.0.0.1:4320
 ```
 
-Pengembangan UI (hot reload di 4321, API tetap 4320): `npm run dev`.
-Pindahkan laporan dari versi lama (kalau ada `data/reports/`): `npm run migrate:v1`.
+Pengembangan UI (hot reload di 4321, API tetap 4320): `bun run dev`.
+Pindahkan laporan dari versi lama (kalau ada `data/reports/`): `bun run migrate:v1`.
 
 ### Alias domain lokal (`http://ai-team.local`)
 
@@ -39,12 +39,12 @@ sudo nginx -t && sudo systemctl reload nginx
 ```
 
 `127.0.0.1:4320` tetap bisa dipakai; `ai-team.service` tidak perlu di-restart. Alias ini hanya untuk
-build produksi — UI dev `npm run dev` tetap di port Vite 4321. `/etc/hosts` dibaca lebih dulu daripada
+build produksi — UI dev `bun run dev` tetap di port Vite 4321. `/etc/hosts` dibaca lebih dulu daripada
 mDNS (`nsswitch: files mdns4_minimal`), jadi akhiran `.local` aman walau Avahi aktif.
 
 ### Auto-start (systemd user service)
 
-Supaya server hidup sendiri setelah login — tanpa `nohup npx tsx server/main.ts` lagi:
+Supaya server hidup sendiri setelah login — tanpa `nohup bun server/main.ts` lagi:
 
 ```bash
 kill $(ss -ltnp | sed -nE 's/.*127\.0\.0\.1:4320.*pid=([0-9]+).*/\1/p')   # matikan instance manual
@@ -63,15 +63,15 @@ Operasi harian:
 
 ```bash
 systemctl --user restart ai-team               # setelah ubah kode server
-npm run build && systemctl --user restart ai-team   # setelah ubah UI (web/)
+bun run build && systemctl --user restart ai-team   # setelah ubah UI (web/)
 journalctl --user -u ai-team -f                # log (data/server.log hanya untuk run manual)
 systemctl --user status ai-team                # status + PID
 ```
 
 Service ini mulai saat Anda login dan berhenti saat logout; tugas yang tertunda dilanjutkan
 otomatis saat start berikutnya. Kalau ingin hidup sejak boot tanpa login: `loginctl enable-linger jae`
-— unit-nya tidak perlu diubah. Node datang dari nvm, jadi setelah upgrade node sesuaikan versi di
-`Environment=PATH`, lalu `systemctl --user daemon-reload && systemctl --user restart ai-team`.
+— unit-nya tidak perlu diubah. Server berjalan di Bun (`~/.bun/bin/bun`); setelah `bun upgrade`, cukup
+`systemctl --user restart ai-team`.
 
 ## Cara kerja
 
@@ -145,7 +145,7 @@ Tiap tugas berjalan dalam salah satu dari tiga mode. Bawaannya diatur per bot di
 - **Ditolak, tanpa bisa disetujui:** `rm -rf` pada direktori sistem, `mkfs`, `dd of=/dev/…`, `shutdown`/`reboot`, fork bomb, `DROP DATABASE`.
 - **Selalu minta persetujuan, walau mode Auto:** service & container (`systemctl restart`, `docker compose down`, `pm2 restart`) · data & database (`TRUNCATE`, migrasi, `pg_restore`, `docker volume rm`) · kredensial, firewall & akses (`ufw`, `iptables`, `ssh-keygen`, tulis `.env`) · hapus berkas & instalasi paket (`rm` di luar area kerja, `apt install`) · perintah yang isinya tidak bisa dinilai (`sudo` di dalam `ssh`, `curl … | sh`).
 
-Polanya ada di `server/policy.ts` sebagai tabel data, dan `npm run check:policy` menguji 37 kasus tanpa biaya model. Alasan penolakan atau permintaan izin ditulis di kartu, mis. *"Perlu persetujuan owner · hapus berkas & paket: mengubah paket sistem."*
+Polanya ada di `server/policy.ts` sebagai tabel data, dan `bun run check:policy` menguji 37 kasus tanpa biaya model. Alasan penolakan atau permintaan izin ditulis di kartu, mis. *"Perlu persetujuan owner · hapus berkas & paket: mengubah paket sistem."*
 
 ## Notifikasi browser
 

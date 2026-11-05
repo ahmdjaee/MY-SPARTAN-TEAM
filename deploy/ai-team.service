@@ -11,12 +11,11 @@ WorkingDirectory=/var/www/ai-team
 
 # WAJIB: Agent SDK memanggil `claude` dari PATH (tidak ada node_modules/.bin/claude;
 # yang dipakai ~/.local/bin/claude). Tanpa ini server tampak sehat tapi semua tugas gagal.
-# Node datang dari nvm, jadi versinya eksplisit — ini satu-satunya tempat yang perlu
-# disunting kalau node di-upgrade lewat nvm.
-Environment=PATH=%h/.nvm/versions/node/v26.3.0/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+# Runtime server adalah Bun dari ~/.bun/bin, jadi unit ini tidak bergantung pada Node/nvm.
+Environment=PATH=%h/.bun/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 Environment=NODE_ENV=production
 
-ExecStart=/usr/bin/env npx tsx server/main.ts
+ExecStart=%h/.bun/bin/bun server/main.ts
 
 Restart=on-failure
 RestartSec=5
