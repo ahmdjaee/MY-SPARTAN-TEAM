@@ -10,16 +10,17 @@ import {
   type ProjectReport as ReportData,
 } from "../api.ts";
 import { renderMarkdown } from "../markdown.ts";
+import { subscribe } from "../realtime.ts";
 import { taskPath } from "../routes.tsx";
 import { ProjectRecap } from "./ProjectRecap.tsx";
 
-const SEVERITY_STYLE: Record<FindingSeverity, string> = {
+export const SEVERITY_STYLE: Record<FindingSeverity, string> = {
   blocker: "bg-tag-red text-tag-red-ink",
   major: "bg-tag-orange text-tag-orange-ink",
   minor: "bg-tag-gray text-tag-gray-ink",
 };
 
-const STATUS_STYLE: Record<FindingStatus, string> = {
+export const STATUS_STYLE: Record<FindingStatus, string> = {
   open: "bg-tag-red text-tag-red-ink",
   needs_retest: "bg-tag-yellow text-tag-yellow-ink",
   fixed: "bg-tag-green text-tag-green-ink",
@@ -114,13 +115,27 @@ export function ProjectReport({ projectId, search }: { projectId: string; search
     void load();
   }, [projectId]);
 
-  // Selama kurator jalan atau terjadwal, baca ulang berkala supaya hasilnya muncul sendiri.
-  const busy = Boolean(report?.curator.running || report?.curator.scheduledAt);
+  // Temuan, kurator (jalan/terjadwal/selesai), dan status tugas project ini didorong server lewat
+  // WebSocket — pengganti polling 4 detik yang hanya aktif kalau kurator sudah sibuk saat halaman dibuka.
   useEffect(() => {
-    if (!busy) return;
-    const timer = setInterval(() => void load(), 4_000);
-    return () => clearInterval(timer);
-  }, [busy, projectId]);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let ready = false;
+    const soon = (): void => {
+      if (timer) return;
+      timer = setTimeout(() => {
+        timer = undefined;
+        void load();
+      }, 300);
+    };
+    const off = subscribe(`project:${projectId}`, soon, {
+      // Tersambung ulang: perubahan selama terputus tidak terlewat.
+      onReady: () => (ready ? soon() : (ready = true)),
+    });
+    return () => {
+      if (timer) clearTimeout(timer);
+      off();
+    };
+  }, [projectId]);
 
   const findings = report?.findings;
   const areas = useMemo(

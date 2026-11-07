@@ -1,31 +1,34 @@
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { basename, join } from "node:path";
 import { Router } from "express";
-import { bus } from "../agent/bus.ts";
 import { curator } from "../agent/curator.ts";
 import { scheduler } from "../agent/scheduler.ts";
 import { BOUNDARY, live } from "../browser/live.ts";
 import { CONFIG } from "../config.ts";
+import { readRegister } from "../findings.ts";
 import { defaultProjectId, getProject, workspaceForProject } from "../projects.ts";
+import { reportRounds, verdictOf } from "../recap.ts";
+import { renderTaskFindingsMarkdown } from "../report-markdown.ts";
 import { ROLES, ROLE_IDS, isRoleId } from "../roles.ts";
 import { threads } from "../store.ts";
+import { buildTaskFindings } from "../task-report.ts";
 import {
   assetsDir,
   createTask,
   getTask,
   hasNotes,
+  isImageName,
   readNotes,
   writeNotes,
   listAssets,
   listDocs,
   listTasks,
-  onTasksChanged,
   readReport,
   resolveDoc,
   updateTask,
   type TaskStatus,
 } from "../tasks.ts";
-import { EPHEMERAL_EVENTS, type AttentionEvent, type AutonomyMode, type StoredEvent } from "../types.ts";
+import type { AutonomyMode } from "../types.ts";
 import { defaultModeFor } from "../settings.ts";
 
 export const tasksRouter = Router();
@@ -120,7 +123,7 @@ tasksRouter.get("/tasks/:id", (req, res) => {
     docs: listDocs(task.id),
     report: readReport(task.id) ?? null,
     hasNotes: hasNotes(task.id),
-    live: live.state(task.id),
+    live: live.view(task.id),
     mode: task.mode ?? defaultModeFor(task.role),
   });
 });
@@ -195,44 +198,6 @@ tasksRouter.post("/tasks/:id/project", (req, res) => {
   res.json({ ok: true, task });
 });
 
-/** Satu aliran untuk seluruh aplikasi: dipakai notifikasi browser. */
-tasksRouter.get("/events", (req, res) => {
-  res.writeHead(200, {
-    "Content-Type": "text/event-stream",
-    "Cache-Control": "no-cache, no-transform",
-    Connection: "keep-alive",
-    "X-Accel-Buffering": "no",
-  });
-  res.write(": connected\n\n");
-
-  const unsubscribe = bus.subscribeAll((event: AttentionEvent) => res.write(`data: ${JSON.stringify(event)}\n\n`));
-  // Daftar tugas berubah → klien memuat ulang daftar, bukan polling tiap 3 detik.
-  // Dinamai `event:` supaya tidak masuk onmessage notifikasi.
-  let pending: NodeJS.Timeout | undefined;
-  const unsubscribeTasks = onTasksChanged(() => {
-    if (pending) return;
-    pending = setTimeout(() => {
-      pending = undefined;
-      res.write("event: tasks_changed\ndata: {}\n\n");
-    }, 300);
-  });
-  const ping = setInterval(() => res.write(": ping\n\n"), 15_000);
-  req.on("close", () => {
-    clearInterval(ping);
-    if (pending) clearTimeout(pending);
-    unsubscribe();
-    unsubscribeTasks();
-  });
-});
-
-tasksRouter.get("/tasks/:id/live/status", (req, res) => {
-  if (!getTask(req.params.id)) {
-    res.status(404).json({ error: "tugas tidak ditemukan" });
-    return;
-  }
-  res.json({ ...live.state(req.params.id), hasFrame: Boolean(live.lastFrame(req.params.id)) });
-});
-
 /** Aliran MJPEG: bisa langsung dipasang di <img src>, tanpa dekoder di sisi klien. */
 tasksRouter.get("/tasks/:id/live", (req, res) => {
   const task = getTask(req.params.id);
@@ -249,54 +214,15 @@ tasksRouter.get("/tasks/:id/live", (req, res) => {
     "X-Accel-Buffering": "no",
   });
 
+  // `subscribe` menulis header bagian pembuka dan frame terakhir yang masih terkini; selama ada
+  // penonton screencast menyala sendiri.
   const unsubscribe = live.subscribe(task.id, res);
-  live.sendLastFrame(task.id, res);
   // Kirim ulang frame terakhir secara berkala supaya koneksi tidak dianggap mati
   // saat halaman yang diuji sedang diam (screencast hanya mengirim saat repaint).
   const heartbeat = setInterval(() => live.sendLastFrame(task.id, res), 10_000);
 
   req.on("close", () => {
     clearInterval(heartbeat);
-    unsubscribe();
-  });
-});
-
-tasksRouter.get("/tasks/:id/events", (req, res) => {
-  const task = getTask(req.params.id);
-  if (!task) {
-    res.status(404).end();
-    return;
-  }
-  res.writeHead(200, {
-    "Content-Type": "text/event-stream",
-    "Cache-Control": "no-cache, no-transform",
-    Connection: "keep-alive",
-    "X-Accel-Buffering": "no",
-  });
-  res.write(": connected\n\n");
-
-  // `id:` hanya untuk event yang tersimpan: browser mengirimnya balik sebagai Last-Event-ID
-  // saat menyambung ulang, dan event ephemeral (delta/status) tidak bisa di-replay.
-  const push = (event: StoredEvent | Record<string, unknown>) => {
-    const seq = typeof event.seq === "number" ? event.seq : 0;
-    const persisted = seq > 0 && !EPHEMERAL_EVENTS.has(String(event.type));
-    res.write(`${persisted ? `id: ${seq}\n` : ""}data: ${JSON.stringify(event)}\n\n`);
-  };
-  const runner = scheduler.getRunner(task.id);
-  push({ type: "status", status: runner?.status ?? "idle", seq: 0, ts: new Date().toISOString(), taskId: task.id });
-  for (const request of runner?.openRequests() ?? []) {
-    push({ ...request, seq: 0, ts: new Date().toISOString(), taskId: task.id, role: task.role });
-  }
-
-  // Replay event yang terlewat sejak `after` (atau Last-Event-ID), lalu langsung berlangganan —
-  // keduanya sinkron berurutan, jadi tidak ada celah maupun duplikat.
-  const after = positiveInt(req.query.after) ?? positiveInt(req.get("last-event-id"));
-  if (after !== undefined) for (const event of threads.readAfter(task.id, after)) push(event);
-
-  const unsubscribe = bus.subscribe(task.id, push);
-  const ping = setInterval(() => res.write(": ping\n\n"), 15_000);
-  req.on("close", () => {
-    clearInterval(ping);
     unsubscribe();
   });
 });
@@ -376,6 +302,48 @@ tasksRouter.get("/tasks/:id/report", (req, res) => {
   res.json({ text: readReport(req.params.id) ?? null });
 });
 
+/** Laporan tugas: putaran kerja dari report.md dan status temuan dari register. Dipoll selama tab Laporan terbuka. */
+tasksRouter.get("/tasks/:id/report-view", (req, res) => {
+  const task = getTask(req.params.id);
+  if (!task) {
+    res.status(404).json({ error: "tugas tidak ditemukan" });
+    return;
+  }
+  try {
+    const report = readReport(task.id) ?? "";
+    res.json({
+      hasReport: report.trim().length > 0,
+      verdict: verdictOf(report) ?? null,
+      rounds: reportRounds(report),
+      assets: listAssets(task.id),
+      ...buildTaskFindings(task.id, report, readRegister(task.projectId)),
+    });
+  } catch (error) {
+    res.status(500).json({ error: (error as Error).message });
+  }
+});
+
+/** Unduhan temuan satu tugas; isinya mengikuti tab Temuan dan Resolved. */
+tasksRouter.get("/tasks/:id/findings.md", (req, res) => {
+  const task = getTask(req.params.id);
+  if (!task) {
+    res.status(404).json({ error: "tugas tidak ditemukan" });
+    return;
+  }
+  try {
+    const markdown = renderTaskFindingsMarkdown({
+      task,
+      project: { name: getProject(task.projectId)?.name ?? task.projectId },
+      generatedAt: new Date().toISOString(),
+      ...buildTaskFindings(task.id, readReport(task.id) ?? "", readRegister(task.projectId)),
+    });
+    res.attachment(`temuan-${task.id}-${new Date().toLocaleDateString("sv-SE")}.md`);
+    res.type("text/markdown").send(markdown);
+  } catch (error) {
+    res.status(500).json({ error: (error as Error).message });
+  }
+});
+
 /** Teks lampiran dipotong di sini supaya tab tetap enteng kalau agen menulis log besar. */
 const DOC_TEXT_LIMIT = 512 * 1024;
 
@@ -417,9 +385,9 @@ tasksRouter.get("/tasks/:id/doc/raw", (req, res) => {
 
 tasksRouter.get("/tasks/:id/assets/:file", (req, res) => {
   const task = getTask(req.params.id);
-  // basename() mencegah path traversal lewat nama file.
+  // basename() mencegah path traversal lewat nama file; hanya gambar yang dilayani (sama seperti listAssets).
   const file = basename(req.params.file);
-  if (!task || !listAssets(task.id).includes(file)) {
+  if (!task || !isImageName(file)) {
     res.status(404).end();
     return;
   }

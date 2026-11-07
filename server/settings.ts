@@ -32,6 +32,7 @@ function defaults(): Settings {
       qa: envMode("AUTONOMY_QA"),
       engineer: envMode("AUTONOMY_ENGINEER"),
       devops: envMode("AUTONOMY_DEVOPS"),
+      uiux: envMode("AUTONOMY_UIUX"),
     },
     notifications: { approval: true, question: true, needsReview: true, failed: true, onlyWhenHidden: true },
   };

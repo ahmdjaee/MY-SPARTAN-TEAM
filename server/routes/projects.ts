@@ -31,12 +31,13 @@ import {
   type FindingStatus,
   type Register,
 } from "../findings.ts";
-import { listTasks } from "../tasks.ts";
+import { listTasks, tasksInProject } from "../tasks.ts";
 
 export const projectsRouter = Router();
 
+/** Cukup angka dari indeks memori — listTasks() ikut membaca folder aset tiap tugas aktif. */
 function withStats(project: Project) {
-  const tasks = listTasks({ project: project.id });
+  const tasks = tasksInProject(project.id);
   return {
     ...project,
     workspaceDir: workspaceForProject(project.id),

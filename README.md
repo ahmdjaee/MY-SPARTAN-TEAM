@@ -1,12 +1,13 @@
-# AI Team — daftar tugas yang dikerjakan bot QA / Engineer / DevOps
+# AI Team — daftar tugas yang dikerjakan bot QA / Engineer / DevOps / UI/UX
 
-Aplikasi pribadi untuk menugaskan pekerjaan nyata ke tiga rekan kerja AI senior. Anda menulis tugas, memilih bot, dan tugas itu langsung dikerjakan di mesin ini. Anda membaca hasilnya per tugas, me-review, atau mengopernya ke bot lain.
+Aplikasi pribadi untuk menugaskan pekerjaan nyata ke empat rekan kerja AI senior. Anda menulis tugas, memilih bot, dan tugas itu langsung dikerjakan di mesin ini. Anda membaca hasilnya per tugas, me-review, atau mengopernya ke bot lain.
 
 | Bot | Yang dia kerjakan | Hasil yang Anda baca |
 |---|---|---|
 | **QA Engineer** | Menguji lewat Chromium (buka, klik, isi form, unggah berkas, baca console) | tab **Live** untuk menonton langsung · `report.md` + screenshot bukti di tab **Laporan** |
 | **Software Engineer** | Mengubah kode di `WORKSPACE_DIR`, menjalankan test | Transcript + tab **Perubahan** (git status & diff) |
 | **DevOps Engineer** | Inspeksi server, rencana + rollback, eksekusi setelah Anda setujui | Transcript + kartu persetujuan per perintah |
+| **UI/UX Designer** | Mengaudit tampilan, alur, aksesibilitas, dan responsif lewat Chromium; tidak mengubah kode | tab **Live** · `report.md` berisi temuan + spesifikasi untuk Engineer di tab **Laporan** |
 
 Semua bot memakai **sesi login Claude Code yang sudah ada di mesin ini** (`~/.claude/.credentials.json`) lewat
 `@anthropic-ai/claude-agent-sdk` — tanpa `ANTHROPIC_API_KEY`. Buktinya ada di sidebar: email dan tipe langganan Anda.
@@ -28,8 +29,8 @@ Pindahkan laporan dari versi lama (kalau ada `data/reports/`): `bun run migrate:
 ### Alias domain lokal (`http://ai-team.local`)
 
 Supaya tidak mengetik `127.0.0.1:4320`: nginx yang sudah ada di port 80 meneruskan nama `ai-team.local`
-ke server aplikasi. Berkas vhost-nya ada di `deploy/nginx/ai-team.local.conf` (buffering dimatikan supaya
-SSE dan Live MJPEG tidak tertahan). Pasang sekali:
+ke server aplikasi. Berkas vhost-nya ada di `deploy/nginx/ai-team.local.conf`: header `Upgrade` diteruskan
+untuk WebSocket `/api/ws`, dan buffering dimatikan supaya Live MJPEG tidak tertahan. Pasang sekali:
 
 ```bash
 echo "127.0.0.1 ai-team.local" | sudo tee -a /etc/hosts
@@ -38,9 +39,15 @@ sudo ln -s /etc/nginx/sites-available/ai-team.local /etc/nginx/sites-enabled/ai-
 sudo nginx -t && sudo systemctl reload nginx
 ```
 
+Sudah memasang versi lama (tanpa `map $http_upgrade`)? Salin ulang berkasnya lalu `sudo nginx -t && sudo systemctl
+reload nginx`. Tanpa itu halaman lewat `ai-team.local` tetap terbuka, tapi tidak menerima pembaruan live
+(penanda *terputus* menyala).
+
 `127.0.0.1:4320` tetap bisa dipakai; `ai-team.service` tidak perlu di-restart. Alias ini hanya untuk
 build produksi — UI dev `bun run dev` tetap di port Vite 4321. `/etc/hosts` dibaca lebih dulu daripada
-mDNS (`nsswitch: files mdns4_minimal`), jadi akhiran `.local` aman walau Avahi aktif.
+mDNS (`nsswitch: files mdns4_minimal`), jadi akhiran `.local` aman walau Avahi aktif. Server baru
+mempercayai nama `ai-team.local` kalau baris `/etc/hosts` di atas ada — tanpa itu nama `.local` dijawab
+mDNS dan bisa diklaim perangkat lain di LAN (DNS rebinding).
 
 ### Auto-start (systemd user service)
 
@@ -75,11 +82,13 @@ otomatis saat start berikutnya. Kalau ingin hidup sejak boot tanpa login: `login
 
 ## Cara kerja
 
-1. **+ Tugas** → project, judul, instruksi, bot, dan (untuk QA) URL yang diuji. Tugas langsung masuk antrean.
-2. Maksimal `MAX_CONCURRENT_AGENTS` tugas berjalan bersamaan (default 2). Tugas **Engineer/DevOps** saling menunggu hanya kalau **workspace-nya sama** — dua project dengan folder berbeda boleh menulis bersamaan; tugas QA selalu boleh paralel.
+1. **+ Tugas** → project, judul, instruksi, bot, dan (untuk QA dan UI/UX) URL yang diuji. Tugas langsung masuk antrean.
+2. Maksimal `MAX_CONCURRENT_AGENTS` tugas berjalan bersamaan (default 2). Tugas **Engineer/DevOps** saling menunggu hanya kalau **workspace-nya sama** — dua project dengan folder berbeda boleh menulis bersamaan; tugas QA dan UI/UX selalu boleh paralel. Selama bot menunggu keputusan Anda, slotnya dipakai tugas lain, tapi folder kerjanya tetap terkunci sampai turn itu selesai — termasuk setelah Stop, sampai proses Claude benar-benar berhenti.
 3. Saat bot minta izin menjalankan sesuatu, muncul **kartu persetujuan**: *Izinkan*, *Izinkan & ingat*, atau *Tolak* dengan alasan. Agen berhenti sampai Anda memutuskan, dan alasan penolakan dibacanya.
-4. Setelah selesai, status jadi **perlu dibaca**. Buka tab **Laporan** (QA) atau **Perubahan** (kode), lalu **Review**: *Setuju* menutup tugas; *Perlu perbaikan* mengirim komentar Anda ke bot yang sama dan tugas kembali dikerjakan.
-   - Tab **Laporan** berisi `report.md` plus galeri bukti screenshot. Berkas teks lain yang ditulis agen ke folder tugas — laporan tambahan `.md`, bukti data `.tsv`/`.txt`, patch, skrip uji, berkas uji unggahan di `uploads/` — tampil di tab **Lampiran**: daftar berkas di kiri, isinya dirender di kanan (`.md` sebagai markdown, sisanya apa adanya), dengan tombol **Unduh** per berkas. Tidak perlu lagi membuka `data/tasks/` dari terminal.
+4. Setelah selesai, status jadi **perlu dibaca**. Buka tab **Laporan** (QA, UI/UX) atau **Perubahan** (kode), lalu **Review**: *Setuju* menutup tugas; *Perlu perbaikan* mengirim komentar Anda ke bot yang sama dan tugas kembali dikerjakan.
+   - Tab **Laporan** punya tiga bagian. **Report utama** menampilkan verdict terkini dan `report.md` per putaran (laporan awal, perbaikan, uji ulang), yang terbaru di atas, plus galeri bukti. **Temuan** berisi temuan terbuka per severity beserta detail dari laporan; temuan yang belum dikurasi berlabel *belum masuk register*. **Resolved** berisi temuan yang sudah ditangani: *menunggu uji ulang*, *terverifikasi*, *diperbaiki*, *tidak diperbaiki*, atau *bukan masalah*. Isinya memuat ulang sendiri, dan tombol **Download temuan** mengunduh temuan tugas itu.
+   - Status temuan berubah saat bot melapor: Engineer/DevOps lewat `finding_report_fixed` (pindah ke Resolved, menunggu uji ulang), QA lewat `finding_retest` (lolos jadi terverifikasi; gagal kembali ke Temuan dengan tanda regresi). Hanya QA yang bisa memverifikasi. UI/UX melaporkan temuan lewat `report.md` dan tidak mengubah statusnya.
+   - Berkas teks lain yang ditulis agen ke folder tugas — laporan tambahan `.md`, bukti data `.tsv`/`.txt`, patch, skrip uji, berkas uji unggahan di `uploads/` — tampil di tab **Lampiran**: daftar berkas di kiri, isinya dirender di kanan (`.md` sebagai markdown, sisanya apa adanya), dengan tombol **Unduh** per berkas. Tidak perlu lagi membuka `data/tasks/` dari terminal.
 5. Tab **Kerja** hanya ikut turun kalau Anda memang sedang berada di dasar. Begitu Anda scroll ke atas untuk membaca chat lama, tampilan diam walau agen terus menulis; yang muncul cuma tombol **Pesan baru ↓** (berubah kuning jadi **Menunggu keputusan Anda ↓** kalau ada kartu persetujuan). Kembali ke dasar — lewat tombol itu atau scroll sendiri — membuatnya mengikuti lagi.
 6. **Oper ke…** memindahkan tugas ke bot lain. Bot baru menerima instruksi asli, **ringkasan serah terima** bot sebelumnya, catatan operan Anda, dan daftar bukti yang sudah ada. Riwayatnya tampil sebagai `QA → Engineer → QA`.
 7. Bot bisa **mengusulkan** operan sendiri (`suggest_handoff`); usulan muncul sebagai tombol satu-klik, tidak pernah jalan tanpa Anda.
@@ -100,6 +109,7 @@ Posisi Anda tersimpan di alamat, jadi refresh — termasuk setelah `systemctl --
 /                                 daftar; langsung membuka tugas teratas
 /tasks/T-015                      tab bawaan (Kerja), atau Live kalau browser QA sedang hidup
 /tasks/T-015/report               tab: work · live · report · docs · notes · diff
+/tasks/T-015/report?section=findings   bagian laporan: findings · resolved (bawaan: Report utama)
 /tasks/T-015/docs?doc=audit.md    lampiran yang sedang dibaca
 /tasks/T-015/notes?view=preview   catatan pribadi Anda untuk tugas itu
 /projects/ews-local               halaman project; ?tab=context|memory|tasks|settings
@@ -128,7 +138,7 @@ Tab **Live** di panel tugas menampilkan isi browser QA saat itu juga — halaman
 - Tombol **Buka di tab baru** menampilkan aliran gambarnya penuh satu layar (`/api/tasks/<id>/live`, MJPEG biasa).
 - Setelah sesi browser berakhir, frame terakhir dibiarkan membeku di panel; bukti permanennya tetap screenshot di tab Laporan.
 
-Secara teknis: CDP `Page.startScreencast` → JPEG (maks ±10 fps, lebar 1280) → MJPEG lewat `multipart/x-mixed-replace`. Kalau screencast gagal, fitur ini mati diam-diam dan pengujian tetap berjalan.
+Secara teknis: CDP `Page.startScreencast` → JPEG (lebar 1280, hingga 60 fps — setiap gambar Chromium selama halaman berubah) → MJPEG lewat `multipart/x-mixed-replace`. Header frame berikutnya langsung dikirim di belakang tiap frame, karena Chrome baru menampilkan satu frame MJPEG setelah header frame berikutnya datang. Screencast hanya menyala selama ada yang menonton: tanpa penonton (tab Live tertutup atau tab browser disembunyikan) ia berhenti ±3 detik kemudian supaya Chromium tidak membakar CPU, dan saat tab Live dibuka lagi frame keadaan sekarang datang dalam ±25 ms. Sesi browser yang ditutup tanpa penonton menyimpan satu screenshot penutup, jadi frame yang membeku adalah keadaan akhir halaman. Kalau screencast gagal, fitur ini mati diam-diam dan pengujian tetap berjalan.
 
 ## Mode otonomi
 
@@ -151,7 +161,9 @@ Polanya ada di `server/policy.ts` sebagai tabel data, dan `bun run check:policy`
 
 Agen yang berhenti menunggu keputusan tidak lagi terlewat. Di **Pengaturan** Anda menyalakan izin notifikasi dan memilih pemicunya: kartu persetujuan, agen bertanya, tugas selesai & perlu dibaca, dan tugas gagal. Bawaannya notifikasi hanya muncul saat tab AI Team **tidak aktif** — saat tabnya terbuka, kartunya sudah terlihat sendiri.
 
-Jumlah tugas yang menunggu keputusan selalu tampil di judul tab, mis. `(2) AI Team`. Notifikasi berlaku lintas tugas (satu aliran `GET /api/events`), jadi tetap muncul walau Anda sedang membuka tugas lain atau halaman Pengaturan.
+Jumlah tugas yang menunggu keputusan selalu tampil di judul tab, mis. `(2) AI Team`. Notifikasi berlaku lintas tugas, jadi tetap muncul walau Anda sedang membuka tugas lain atau halaman Pengaturan. Stop yang Anda tekan sendiri tidak memunculkan notifikasi (tugasnya jadi *perlu dibaca*, bukan *gagal*).
+
+Semua pembaruan live — thread, status, tab Live, laporan, rekap project, panel Tanya, dan notifikasi — lewat **satu WebSocket per tab** (`/api/ws`), tanpa polling. Kalau sambungannya putus (mis. server di-restart), penanda *terputus* menyala, lalu tab menyambung sendiri dan server mengirim ulang event yang terlewat.
 
 ## Tanya (chat incognito)
 
@@ -215,7 +227,7 @@ Urutan evaluasi Claude Code: **hooks → deny → ask → permission mode → al
 - `allow` berisi perintah yang boleh jalan sendiri: `npm test`, `git status/diff`, `df`, `docker ps`, dan sejenisnya.
 - **`ask` sengaja dikosongkan.** `ask` dievaluasi *sebelum* `allow`, jadi menaruh `"Bash"` di sana membuat seluruh allow-list tidak berguna. Perintah di luar allow-list tetap sampai ke kartu persetujuan lewat `canUseTool`.
 - QA tidak boleh mengubah kode: ada deny `Edit(//<WORKSPACE_DIR>/**)`. Ia hanya menulis di folder tugasnya.
-- Engineer tidak boleh `git commit`/`git push` — perubahan ditinggal di working tree supaya Anda yang memutuskan.
+- Engineer hanya `git commit` kalau Anda memintanya (dijaga hook di `server/policy.ts`), tanpa kartu persetujuan. Pesannya memakai Conventional Commits dalam bahasa Inggris, tanpa atribusi Claude. Kalau tidak diminta, perubahan ditinggal di working tree. `git push` tetap dilarang.
 
 Aturan per bot ada di `server/roles.ts`, persona di `server/prompts/*.md`. Keduanya memang dibuat untuk Anda sunting.
 
@@ -225,10 +237,13 @@ Aturan per bot ada di `server/roles.ts`, persona di `server/prompts/*.md`. Kedua
 |---|---|
 | `WORKSPACE_DIR` | Folder kerja **bawaan** Engineer & DevOps, dipakai project yang tidak punya folder sendiri. |
 | `TARGET_URL` | URL target **bawaan**, dipakai project yang tidak punya URL sendiri. |
-| `MODEL_QA` / `MODEL_ENGINEER` / `MODEL_DEVOPS` | Model per bot. |
+| `MODEL_QA` / `MODEL_ENGINEER` / `MODEL_DEVOPS` / `MODEL_UIUX` | Model per bot. |
 | `EFFORT_*` | `low` … `max`. Makin tinggi makin teliti, makin lambat, makin boros kuota. |
 | `MAX_CONCURRENT_AGENTS` | Berapa tugas boleh jalan bersamaan (default 2). |
 | `IDLE_SHUTDOWN_MS` | Kapan subprocess tugas yang menganggur ditutup (default 10 menit). |
+| `STOP_GRACE_MS` | Batas tunggu turn yang dihentikan dengan Stop (default 20 detik); lewat dari itu proses Claude ditutup paksa (sesinya tetap bisa dilanjutkan). |
+| `ASK_TIMEOUT_MS` | Batas waktu satu jawaban panel Tanya (default 5 menit). |
+| `ALLOWED_HOSTS` / `ALLOWED_ORIGINS` | Host/Origin tambahan yang boleh membuka API dan WebSocket, dipisah koma. Bawaan: `127.0.0.1`, `localhost`, `::1`, plus `ai-team.local` kalau `/etc/hosts` mengarahkannya ke `127.0.0.1` (dicek ulang tiap 30 detik). Permintaan dari situs lain ditolak `403` (anti CSRF dan DNS rebinding). |
 | `INCLUDE_USER_SETTINGS` | `1` untuk ikut memuat skill/plugin global dari `~/.claude`. |
 
 ## Data

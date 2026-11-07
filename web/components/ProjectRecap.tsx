@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import {
   ROLE_SHORT,
@@ -72,6 +72,12 @@ const BOX = "rounded-lg border border-line bg-panel p-3 text-sm text-muted";
 function preview(text: string): string {
   return text.replace(/[*`]/g, "").replace(/\s+/g, " ").trim();
 }
+
+/** Laporan yang dibentangkan di-parse sekali per isi, bukan setiap rekap dimuat ulang. */
+const ReportMarkdown = memo(function ReportMarkdown({ text, taskId }: { text: string; taskId: string }) {
+  const html = useMemo(() => renderMarkdown(text, taskId), [text, taskId]);
+  return <div className="markdown" dangerouslySetInnerHTML={{ __html: html }} />;
+});
 
 export function ProjectRecap({ projectId, search }: { projectId: string; search: URLSearchParams }) {
   const [recap, setRecap] = useState<RecapData>();
@@ -275,10 +281,7 @@ export function ProjectRecap({ projectId, search }: { projectId: string; search:
                   <p className="text-sm text-muted">report.md tidak bisa dibaca.</p>
                 )}
                 {entry.source === "report" && typeof report === "string" && (
-                  <div
-                    className="markdown"
-                    dangerouslySetInnerHTML={{ __html: renderMarkdown(report, entry.taskId) }}
-                  />
+                  <ReportMarkdown text={report} taskId={entry.taskId} />
                 )}
               </div>
             )}

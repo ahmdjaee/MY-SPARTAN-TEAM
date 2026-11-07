@@ -77,7 +77,7 @@ function Settings({
           placeholder="http://localhost:3000"
           className="mt-1 w-full rounded-lg border border-line bg-page px-3 py-2 text-sm text-ink outline-none focus:border-accent"
         />
-        <span className="mt-1 block text-[11px] text-faint">Mengisi sendiri kolom target saat Anda membuat tugas QA di project ini.</span>
+        <span className="mt-1 block text-[11px] text-faint">Mengisi sendiri kolom target saat Anda membuat tugas QA atau UI/UX di project ini.</span>
       </label>
 
       <label className="block">

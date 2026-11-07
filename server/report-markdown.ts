@@ -7,6 +7,7 @@
 import type { CoverageCell, CoverageState, Finding, FindingSeverity, FindingStatus } from "./findings.ts";
 import { OPEN_STATUSES } from "./findings.ts";
 import type { ProjectRecap, RecapEntry, RecapSeverity, RecapTone } from "./recap.ts";
+import type { TaskFinding, TaskUnlinkedFinding } from "./task-report.ts";
 
 const STATUS_LABEL: Record<FindingStatus, string> = {
   open: "terbuka",
@@ -191,6 +192,55 @@ function headerSections(input: FindingsMarkdownInput): string[] {
       ].join("\n"),
     ].join("\n\n"),
   ];
+}
+
+export type TaskFindingsMarkdownInput = {
+  task: { id: string; title: string };
+  project: { name: string };
+  generatedAt: string;
+  opened: TaskFinding[];
+  resolved: TaskFinding[];
+  unlinked: TaskUnlinkedFinding[];
+};
+
+/** Path bukti relatif tidak berlaku di berkas unduhan; yang tersisa cukup nama berkasnya. */
+function withoutImages(text: string): string {
+  return text.replace(/!\[[^\]]*\]\((?:[^)]*\/)?([^)/]+)\)/g, "(bukti: $1)");
+}
+
+function reportBlocks(blocks: TaskFinding["blocks"]): string[] {
+  return blocks.flatMap((block) => [`**Dari laporan: ${inline(block.heading)}**`, ...(block.body ? [nested(withoutImages(block.body), 3)] : [])]);
+}
+
+function taskFindingBlock({ finding, blocks }: TaskFinding): string {
+  const parts = [findingBlock(finding, { occurrences: false })];
+  if (finding.fix && finding.status === "needs_retest") {
+    parts.push(`**Dilaporkan diperbaiki oleh** ${inline(finding.fix.by)} (${stamp(finding.fix.at)}): ${inline(finding.fix.note)}`);
+  }
+  if (finding.reopenedAt) parts.push(`**Regresi:** dibuka lagi ${stamp(finding.reopenedAt)}`);
+  if (finding.retest && !finding.retest.passed) {
+    parts.push(`**Uji ulang gagal** di ${finding.retest.taskId}: ${inline(finding.retest.note)} (bukti: ${inline(finding.retest.evidence)})`);
+  }
+  return [...parts, ...reportBlocks(blocks)].join("\n\n");
+}
+
+/** Temuan satu tugas, dibagi seperti tab Temuan dan Resolved di laporan tugas. */
+export function renderTaskFindingsMarkdown(input: TaskFindingsMarkdownInput): string {
+  const { task, project, opened, resolved, unlinked } = input;
+  const unlinkedBlocks = unlinked.map((item) =>
+    [
+      `### ${item.id ? `${inline(item.id)} · ` : ""}${inline(item.title)}`,
+      `**Severity:** ${severityText(item.severity)} · **Status:** belum masuk register`,
+      ...(item.body ? [nested(withoutImages(item.body), 3)] : []),
+    ].join("\n\n"),
+  );
+  const openBlocks = [...opened.map(taskFindingBlock), ...unlinkedBlocks];
+  const sections = [
+    `# Temuan ${task.id}: ${inline(task.title)}\n\nProject: ${inline(project.name)}  \nDibuat: ${stamp(input.generatedAt)}`,
+    `## Temuan (${openBlocks.length})\n\n${openBlocks.length > 0 ? openBlocks.join("\n\n") : "Tidak ada."}`,
+    `## Resolved (${resolved.length})\n\n${resolved.length > 0 ? resolved.map(taskFindingBlock).join("\n\n") : "Tidak ada."}`,
+  ];
+  return `${sections.join("\n\n")}\n`;
 }
 
 export function renderFindingsMarkdown(input: FindingsMarkdownInput): string {

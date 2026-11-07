@@ -12,6 +12,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createSdkMcpServer, query, tool, type CanUseTool, type Options } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
+import { notifyProject } from "../changes.ts";
 import { CONFIG, agentEnv } from "../config.ts";
 import {
   COVERAGE_STATES,
@@ -401,6 +402,8 @@ class Curator {
     }, delayMs);
     timer.unref();
     this.timers.set(projectId, { timer, at });
+    // Laporan project menampilkan "dijadwalkan" — klien yang membukanya diberi tahu, bukan polling.
+    notifyProject(projectId);
   }
 
   status(projectId: string): CuratorStatus {
@@ -427,6 +430,7 @@ class Curator {
     }
     this.running.add(projectId);
     this.errors.delete(projectId);
+    notifyProject(projectId);
     try {
       for (let round = 1; round <= MAX_ROUNDS; round += 1) {
         const sources = pendingSources(projectId).slice(0, BATCH);
@@ -443,6 +447,7 @@ class Curator {
       appendLog(projectId, { by: ACTOR, action: "error", detail: message });
     } finally {
       this.running.delete(projectId);
+      notifyProject(projectId);
       if (this.again.delete(projectId)) this.schedule(projectId, 5_000);
     }
   }

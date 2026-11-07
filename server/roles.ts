@@ -98,6 +98,9 @@ export const ROLES: Record<RoleId, RoleDef> = {
         "Bash(git status:*)",
         "Bash(git diff:*)",
         "Bash(git log:*)",
+        // Gerbang "hanya kalau diminta pemilik" ada di hook, lihat server/policy.ts.
+        "Bash(git add:*)",
+        "Bash(git commit:*)",
         "Bash(ls:*)",
         "Bash(cat:*)",
         "Bash(head:*)",
@@ -107,7 +110,6 @@ export const ROLES: Record<RoleId, RoleDef> = {
       ask: [],
       deny: [
         "Bash(git push:*)",
-        "Bash(git commit:*)",
         "Bash(git reset --hard:*)",
         "Bash(git checkout:*)",
         "Bash(rm -rf:*)",
@@ -187,7 +189,34 @@ export const ROLES: Record<RoleId, RoleDef> = {
     usesBrowser: false,
     producesReport: true,
   },
+  uiux: {
+    id: "uiux",
+    title: "UI/UX Designer",
+    blurb: "Mengaudit tampilan dan alur lewat browser, menulis temuan dan spesifikasi untuk Engineer.",
+    model: CONFIG.models.uiux,
+    effort: CONFIG.effort.uiux,
+    permissionMode: "acceptEdits",
+    permissions: {
+      allow: ["mcp__browser__*", "mcp__team__*", "Read", "Glob", "Grep", "TodoWrite"],
+      ask: [],
+      deny: [
+        // Larangan menyunting workspace ditambahkan per project oleh permissionsFor().
+        "Bash(rm:*)",
+        "Bash(git push:*)",
+        "Bash(git commit:*)",
+        ...DENY_ALWAYS,
+      ],
+    },
+    allowedTools: [],
+    disallowedTools: [],
+    persona: persona("uiux"),
+    usesBrowser: true,
+    producesReport: true,
+  },
 };
+
+/** Role yang hanya menilai: kodenya dibaca, perbaikannya tugas Engineer. */
+const READS_WORKSPACE_ONLY: RoleId[] = ["qa", "uiux"];
 
 /**
  * Aturan izin yang memuat path folder, dihitung per project.
@@ -195,8 +224,7 @@ export const ROLES: Record<RoleId, RoleDef> = {
  */
 export function permissionsFor(roleId: RoleId, workspaceDir: string): RoleDef["permissions"] {
   const base = ROLES[roleId].permissions;
-  if (roleId !== "qa") return base;
-  // QA tidak boleh mengubah kode aplikasi — perbaikan adalah tugas Engineer.
+  if (!READS_WORKSPACE_ONLY.includes(roleId)) return base;
   return { ...base, deny: [`Edit(${abs(`${workspaceDir}/**`)})`, ...base.deny] };
 }
 

@@ -95,7 +95,7 @@ export function NewTaskDialog({
         />
 
         <label className="mt-3 block text-xs text-muted">Tugaskan ke</label>
-        <div className="mt-1 flex gap-2">
+        <div className="mt-1 grid grid-cols-2 gap-2 sm:grid-cols-4">
           {roles.map((item) => (
             <button
               key={item.id}

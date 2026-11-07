@@ -1,4 +1,4 @@
-import type { AttentionEvent, AutonomyMode, RoleId, StoredEvent, UiEvent, WorkerStatus } from "../server/types.ts";
+import type { AttentionEvent, AutonomyMode, ContextUsage, RoleId, StoredEvent, UiEvent, WorkerStatus } from "../server/types.ts";
 import type { Settings } from "../server/settings.ts";
 import type { Assignment, Review, Task, TaskStatus, TaskSummary } from "../server/tasks.ts";
 import type { Project } from "../server/projects.ts";
@@ -13,10 +13,23 @@ import type {
   RecapVerdict,
 } from "../server/recap.ts";
 
-export type { AskMessage, Assignment, AttentionEvent, AutonomyMode, Project, RoleId, Review, Settings, StoredEvent, Task, TaskStatus, TaskSummary, UiEvent, WorkerStatus };
+export type { AskMessage, Assignment, AttentionEvent, AutonomyMode, ContextUsage, Project, RoleId, Review, Settings, StoredEvent, Task, TaskStatus, TaskSummary, UiEvent, WorkerStatus };
 export type { ProjectRecap, RecapEntry, RecapFinding, RecapSeverity, RecapTone, RecapTotals, RecapVerdict };
 export type { CoverageCell, CoverageState, Finding, FindingSeverity, FindingStatus, UnlinkedFinding } from "../server/findings.ts";
 export type { CuratorStatus } from "../server/agent/curator.ts";
+
+export type { ReportRound } from "../server/recap.ts";
+export type { TaskFinding, TaskUnlinkedFinding } from "../server/task-report.ts";
+
+export type TaskReportView = {
+  hasReport: boolean;
+  verdict: RecapVerdict | null;
+  rounds: import("../server/recap.ts").ReportRound[];
+  assets: string[];
+  opened: import("../server/task-report.ts").TaskFinding[];
+  resolved: import("../server/task-report.ts").TaskFinding[];
+  unlinked: import("../server/task-report.ts").TaskUnlinkedFinding[];
+};
 
 export type CurationLogItem = {
   at: string;
@@ -64,7 +77,8 @@ export type RoleInfo = {
 
 export type Slots = { inUse: number; max: number; runners: number; workspaceBusy: boolean };
 
-export type LiveState = { active: boolean; url?: string; title?: string; lastFrameAt?: number; hasFrame?: boolean };
+/** Keadaan tab Live; didorong server (event `live` di WebSocket) dan ikut di detail tugas. */
+export type LiveState = { active: boolean; url?: string; title?: string; hasFrame?: boolean };
 
 export type TaskListItem = TaskSummary & { live?: boolean };
 
@@ -98,6 +112,15 @@ export function docRawUrl(id: string, path: string): string {
   return docUrl(id, path, true);
 }
 
+export class ApiError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+  ) {
+    super(message);
+  }
+}
+
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, {
     ...init,
@@ -105,7 +128,7 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
   });
   if (!response.ok) {
     const detail = (await response.json().catch(() => ({}))) as { error?: string };
-    throw new Error(detail.error ?? `${response.status} ${response.statusText}`);
+    throw new ApiError(detail.error ?? `${response.status} ${response.statusText}`, response.status);
   }
   return (await response.json()) as T;
 }
@@ -113,8 +136,6 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
 export const api = {
   roles: () =>
     request<{ workspaceDir: string; targetUrl: string; slots: Slots; roles: RoleInfo[] }>("/api/roles"),
-  auth: () =>
-    request<{ account: { email?: string; subscriptionType?: string } | null; error?: string }>("/api/health/auth"),
 
   tasks: (filter?: { role?: RoleId | ""; status?: TaskStatus | ""; project?: string }) => {
     const params = new URLSearchParams();
@@ -136,8 +157,9 @@ export const api = {
   taskMeta: (id: string) => request<TaskDetail>(`/api/tasks/${id}?events=0`),
   /** Hanya teks report.md — jauh lebih ringan daripada api.task() untuk menampilkan laporan. */
   taskReport: (id: string) => request<{ text: string | null }>(`/api/tasks/${id}/report`),
+  taskReportView: (id: string) => request<TaskReportView>(`/api/tasks/${encodeURIComponent(id)}/report-view`),
+  taskFindingsMarkdownUrl: (id: string) => `/api/tasks/${encodeURIComponent(id)}/findings.md`,
   taskDoc: (id: string, path: string) => request<DocContent>(docUrl(id, path)),
-  liveStatus: (id: string) => request<LiveState>(`/api/tasks/${id}/live/status`),
   taskNotes: (id: string) => request<{ text: string }>(`/api/tasks/${id}/notes`),
   askHistory: (id: string) =>
     request<{ messages: AskMessage[]; busy: boolean; costUsd: number; models: { id: string; label: string }[] }>(
@@ -227,7 +249,7 @@ export const api = {
     ),
 };
 
-export const ROLE_SHORT: Record<RoleId, string> = { qa: "QA", engineer: "Engineer", devops: "DevOps" };
+export const ROLE_SHORT: Record<RoleId, string> = { qa: "QA", engineer: "Engineer", devops: "DevOps", uiux: "UI/UX" };
 
 export const STATUS_LABEL: Record<TaskStatus, string> = {
   queued: "antre",

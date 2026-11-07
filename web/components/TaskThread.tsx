@@ -1,7 +1,9 @@
-import { memo, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { deriveActivity, formatElapsed, formatTokens, type Activity } from "../activity.ts";
 import {
   api,
   type StoredEvent,
+  type TaskStatus,
   type UiEvent,
   type WorkerStatus,
 } from "../api.ts";
@@ -12,6 +14,7 @@ const ROLE_LABEL: Record<string, string> = {
   qa: "QA",
   engineer: "Engineer",
   devops: "DevOps",
+  uiux: "UI/UX",
 };
 
 /** Markdown pesan asisten di-parse sekali per pesan, bukan tiap token streaming atau tiap polling. */
@@ -25,16 +28,10 @@ const AssistantMessage = memo(function AssistantMessage({ text, dim }: { text: s
 });
 
 function rowKey(event: StoredEvent): string {
-  // Permintaan terbuka datang dengan seq 0 — id-nya yang membedakan.
-  const suffix =
-    event.type === "approval"
-      ? event.approvalId
-      : event.type === "question"
-        ? event.questionId
-        : event.type === "tool"
-          ? event.toolUseId
-          : "";
-  return `${event.seq}-${event.type}-${suffix}`;
+  // Tanpa seq: kartu tidak boleh dipasang ulang (dan kehilangan isian) saat seq 0 diganti salinan tersimpan.
+  if (event.type === "approval") return `approval-${event.approvalId}`;
+  if (event.type === "question") return `question-${event.questionId}`;
+  return `${event.seq}-${event.type}-${event.type === "tool" ? event.toolUseId : ""}`;
 }
 
 type ToolResult = Extract<UiEvent, { type: "tool_result" }>;
@@ -79,6 +76,18 @@ function renderRow(event: StoredEvent, resolved: Set<string>, results: Map<strin
           {event.message ? ` — ${event.message}` : ""}
         </p>
       );
+    case "notice":
+      return (
+        <p key={key} data-thread-notice className="rounded-lg border border-line bg-panel px-3 py-2 text-xs text-muted">
+          {event.text}
+        </p>
+      );
+    case "compact":
+      return (
+        <p key={key} data-thread-compact className="rounded-lg border border-line bg-panel px-3 py-2 text-xs text-muted">
+          Konteks diringkas {event.trigger === "auto" ? "otomatis" : "manual"} pada {formatTokens(event.preTokens)} token. Bot bisa kehilangan detail lama; laporan dan register tetap utuh.
+        </p>
+      );
     case "handoff":
       return (
         <p key={key} className="rounded-lg border border-line bg-tag-blue px-3 py-2 text-xs text-tag-blue-ink">
@@ -89,8 +98,14 @@ function renderRow(event: StoredEvent, resolved: Set<string>, results: Map<strin
     case "result":
       return (
         <p key={key} className="border-t border-line pt-2 text-[11px] text-faint">
-          {event.subtype} · {event.numTurns} turn · {(event.durationMs / 1000).toFixed(0)}s
-          {event.costUsd !== undefined ? ` · $${event.costUsd.toFixed(4)}` : ""}
+          {event.interrupted ? "dihentikan" : event.subtype}
+          {event.background ? " · dimulai CLI" : ""} · {event.numTurns} turn · {(event.durationMs / 1000).toFixed(0)}s
+          {/* costUsd = total berjalan sesi; event lama belum punya biaya per turn. */}
+          {event.turnCostUsd !== undefined
+            ? ` · $${event.turnCostUsd.toFixed(4)}`
+            : event.costUsd !== undefined
+              ? ` · total sesi $${event.costUsd.toFixed(4)}`
+              : ""}
         </p>
       );
     case "error":
@@ -104,10 +119,48 @@ function renderRow(event: StoredEvent, resolved: Set<string>, results: Map<strin
   }
 }
 
+/** Timer hidup di sini: tick per detik tidak boleh me-render ulang seluruh thread. */
+function ActivityBar({ activity }: { activity?: Activity }) {
+  const since = activity?.since;
+  const [now, setNow] = useState(() => Date.now());
+
+  useEffect(() => {
+    if (!since) return;
+    setNow(Date.now());
+    const timer = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, [since]);
+
+  if (!activity) return null;
+  const waiting = activity.tone === "waiting";
+
+  return (
+    <div
+      role="status"
+      className={`flex items-center gap-2 text-xs ${waiting ? "text-tag-yellow-ink" : "text-muted"}`}
+    >
+      <span
+        aria-hidden="true"
+        className={`h-1.5 w-1.5 shrink-0 rounded-full ${waiting ? "bg-tag-yellow-ink" : "bg-accent motion-safe:animate-pulse"}`}
+      />
+      <span className="min-w-0 truncate">{activity.label}</span>
+      {since && (
+        <span aria-hidden="true" className="shrink-0 tabular-nums text-faint">
+          {formatElapsed(now - new Date(since).getTime())}
+        </span>
+      )}
+    </div>
+  );
+}
+
+/** Tinggi maksimum kotak ketik (±8 baris); setelah itu isinya yang di-scroll. */
+const INPUT_MAX_HEIGHT = 176;
+
 export function TaskThread({
   taskId,
   events,
   status,
+  taskStatus,
   streaming,
   error,
   disconnected = false,
@@ -119,6 +172,7 @@ export function TaskThread({
   taskId: string;
   events: StoredEvent[];
   status: WorkerStatus;
+  taskStatus?: TaskStatus;
   streaming: string;
   error?: string;
   disconnected?: boolean;
@@ -131,6 +185,7 @@ export function TaskThread({
   const [sending, setSending] = useState(false);
   const bottom = useRef<HTMLDivElement>(null);
   const viewport = useRef<HTMLDivElement>(null);
+  const input = useRef<HTMLTextAreaElement>(null);
   // Boleh ikut turun atau tidak — di ref supaya efek di bawah tidak membaca nilai basi.
   const stick = useRef(true);
   const instant = useRef(true);
@@ -186,7 +241,28 @@ export function TaskThread({
     instant.current = true;
     setHasNew(false);
     setAtBottom(true);
+    // Draf untuk tugas lain tidak boleh ikut terbawa.
+    setText("");
   }, [taskId]);
+
+  useLayoutEffect(() => {
+    const el = input.current;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = `${Math.min(el.scrollHeight, INPUT_MAX_HEIGHT)}px`;
+    el.style.overflowY = el.scrollHeight > INPUT_MAX_HEIGHT ? "auto" : "hidden";
+  }, [text]);
+
+  // Kotak ketik dan bar aktivitas mengubah tinggi area pesan; pesan terakhir jangan sampai tertutup.
+  useEffect(() => {
+    const el = viewport.current;
+    if (!el) return;
+    const observer = new ResizeObserver(() => {
+      if (stick.current) el.scrollTop = el.scrollHeight;
+    });
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, []);
 
   const loadOlder = async () => {
     const el = viewport.current;
@@ -216,13 +292,27 @@ export function TaskThread({
   // Baris dibentuk ulang hanya saat daftar event berubah — bukan saat token streaming datang.
   const rows = useMemo(() => events.map((event) => renderRow(event, resolved, results)), [events, resolved, results]);
 
+  const streamingNow = Boolean(streaming);
+  const activity = useMemo(
+    () => deriveActivity({ status, taskStatus, streaming: streamingNow, events }),
+    [status, taskStatus, streamingNow, events],
+  );
+
+  // Indikatornya bagian dari thread: saat muncul, tetap ikut ke dasar kalau Anda sedang mengikuti.
+  const activityLabel = activity?.label;
+  useEffect(() => {
+    const el = viewport.current;
+    if (stick.current && el) el.scrollTop = el.scrollHeight;
+  }, [activityLabel]);
+
   const send = async () => {
     const value = text.trim();
     if (!value || sending) return;
     setSending(true);
     try {
       await api.message(taskId, value);
-      setText("");
+      // Yang sempat diketik selama pengiriman tidak ikut terhapus.
+      setText((current) => (current.trim() === value ? "" : current));
       // Pesan Anda sendiri wajib terlihat.
       jumpToBottom();
     } catch (cause) {
@@ -235,7 +325,7 @@ export function TaskThread({
   return (
     <div className="flex h-full flex-col">
       <div className="relative min-h-0 flex-1">
-        <div ref={viewport} onScroll={onScroll} className="h-full space-y-3 overflow-y-auto px-5 py-4">
+        <div ref={viewport} onScroll={onScroll} className="thread-rows h-full space-y-3 overflow-y-auto px-5 py-4">
           {error && (
             <div className="rounded-lg border border-line bg-tag-red p-3 text-sm text-tag-red-ink">{error}</div>
           )}
@@ -255,6 +345,7 @@ export function TaskThread({
           {rows}
 
           {streaming && <AssistantMessage text={streaming} dim />}
+          {!disconnected && <ActivityBar activity={activity} />}
           <div ref={bottom} />
         </div>
 
@@ -278,35 +369,52 @@ export function TaskThread({
         )}
       </div>
 
-      <div className="border-t border-line p-3">
-        <div className="flex items-end gap-2">
+      <div className="px-4 pb-4 pt-2">
+        <div
+          className={`rounded-2xl border border-line bg-raised transition-colors focus-within:border-accent ${
+            canSend ? "" : "opacity-60"
+          }`}
+        >
           <textarea
+            ref={input}
             value={text}
             onChange={(e) => setText(e.target.value)}
             onKeyDown={(e) => {
-              if (e.key === "Enter" && !e.shiftKey) {
+              // Enter saat IME masih merangkai kata hanya memilih kata, bukan mengirim.
+              if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
                 e.preventDefault();
                 void send();
               }
             }}
-            rows={2}
+            rows={1}
             disabled={!canSend}
-            placeholder={
-              canSend ? "Arahan tambahan untuk tugas ini… (Enter kirim)" : "Tugas sudah ditutup — buka lagi lewat review."
-            }
-            className="flex-1 resize-none rounded-xl border border-line bg-page px-3 py-2 text-sm text-ink outline-none focus:border-accent disabled:opacity-50"
+            aria-label="Arahan untuk agen"
+            placeholder={canSend ? "Arahan tambahan untuk tugas ini…" : "Tugas sudah ditutup — buka lagi lewat review."}
+            className="block w-full resize-none bg-transparent px-4 pb-1 pt-3 text-sm text-ink outline-none placeholder:text-faint"
           />
-          <button
-            onClick={() => void send()}
-            disabled={sending || !text.trim() || !canSend}
-            className="rounded-xl bg-accent px-4 py-2.5 text-sm font-medium text-on-accent hover:bg-accent-hover disabled:opacity-40"
-          >
-            Kirim
-          </button>
+          <div className="flex items-center justify-between gap-2 px-3 pb-2.5">
+            <span className="hidden truncate pl-1 text-[11px] text-faint sm:block">
+              {canSend ? "Enter kirim · Shift+Enter baris baru" : ""}
+            </span>
+            <button
+              onClick={() => void send()}
+              disabled={sending || !text.trim() || !canSend}
+              aria-label="Kirim"
+              title="Kirim"
+              className="ml-auto flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-accent text-on-accent transition-colors hover:bg-accent-hover disabled:bg-hover disabled:text-faint"
+            >
+              <svg viewBox="0 0 16 16" fill="none" aria-hidden="true" className="h-4 w-4">
+                <path
+                  d="M8 13V3M3.5 7.5 8 3l4.5 4.5"
+                  stroke="currentColor"
+                  strokeWidth="1.75"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                />
+              </svg>
+            </button>
+          </div>
         </div>
-        {status === "waiting" && (
-          <p className="mt-2 text-xs text-tag-yellow-ink">Agen berhenti menunggu keputusan Anda di kartu di atas.</p>
-        )}
       </div>
     </div>
   );

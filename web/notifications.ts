@@ -1,5 +1,6 @@
 import type { AttentionEvent } from "../server/types.ts";
 import type { NotificationSettings } from "../server/settings.ts";
+import { subscribe } from "./realtime.ts";
 
 export type { AttentionEvent, NotificationSettings };
 
@@ -17,26 +18,25 @@ export async function requestPermission(): Promise<NotificationPermission | "uns
   return await Notification.requestPermission();
 }
 
+type GlobalEvent = { type: "attention"; attention: AttentionEvent } | { type: "tasks_changed" };
+
 /**
- * Satu aliran untuk seluruh aplikasi, supaya notifikasi tetap jalan di tugas mana pun.
- * `onTasksChanged` dipanggil saat server menandai daftar tugas berubah (dan saat
- * sambungan terbuka/pulih), menggantikan polling daftar yang rapat.
+ * Satu aliran untuk seluruh aplikasi (topik `global` di WebSocket), supaya notifikasi tetap jalan
+ * di tugas mana pun. `onTasksChanged` dipanggil saat server menandai daftar tugas berubah, dan saat
+ * sambungan terpasang/pulih (perubahan selama terputus tidak terlewat) — pengganti polling daftar.
  */
 export function startAttentionStream(
   onEvent: (event: AttentionEvent) => void,
   onTasksChanged?: () => void,
 ): () => void {
-  const source = new EventSource("/api/events");
-  source.onmessage = (message) => {
-    try {
-      onEvent(JSON.parse(message.data) as AttentionEvent);
-    } catch {
-      // event rusak dilewati
-    }
-  };
-  source.addEventListener("tasks_changed", () => onTasksChanged?.());
-  source.onopen = () => onTasksChanged?.();
-  return () => source.close();
+  return subscribe<GlobalEvent>(
+    "global",
+    (event) => {
+      if (event.type === "attention") onEvent(event.attention);
+      else if (event.type === "tasks_changed") onTasksChanged?.();
+    },
+    { onReady: () => onTasksChanged?.() },
+  );
 }
 
 function enabledFor(kind: AttentionEvent["kind"], settings: NotificationSettings): boolean {
@@ -51,7 +51,7 @@ export function maybeNotify(
   settings: NotificationSettings,
   onClick: (taskId: string) => void,
 ): void {
-  if (!enabledFor(event.kind, settings)) return;
+  if (event.silent || !enabledFor(event.kind, settings)) return;
   if (settings.onlyWhenHidden && !document.hidden) return;
   if (typeof Notification === "undefined" || Notification.permission !== "granted") return;
 

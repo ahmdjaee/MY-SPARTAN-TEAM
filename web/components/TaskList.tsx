@@ -62,6 +62,7 @@ export const TaskList = memo(function TaskList({
           <option value="qa">QA</option>
           <option value="engineer">Engineer</option>
           <option value="devops">DevOps</option>
+          <option value="uiux">UI/UX</option>
         </select>
         <select
           value={filterStatus}

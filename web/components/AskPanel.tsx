@@ -1,6 +1,19 @@
 import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { api, type AskMessage } from "../api.ts";
 import { renderMarkdown } from "../markdown.ts";
+import { subscribe } from "../realtime.ts";
+
+type AskSnapshot = { messages: AskMessage[]; busy: boolean; costUsd: number; models: { id: string; label: string }[] };
+/** Topik `ask:<id>`: snapshot dulu (juga tiap tersambung ulang), lalu aliran jawaban. Tidak ada yang ditulis ke disk. */
+type AskStreamEvent =
+  | ({ type: "snapshot" } & AskSnapshot)
+  | { type: "delta"; text: string }
+  | { type: "answer"; message: AskMessage }
+  | { type: "busy"; busy: boolean }
+  | { type: "error"; message: string };
+
+/** Token jawaban ditampung dan dikeluarkan maksimal 10× per detik, bukan per token. */
+const STREAM_FLUSH_MS = 100;
 
 const WIDTH_KEY = "ai-team-ask-width";
 const DEFAULT_WIDTH = 352;
@@ -28,7 +41,7 @@ const AskAnswer = memo(function AskAnswer({ text, dim }: { text: string; dim?: b
   return <div className={`markdown text-sm${dim ? " opacity-80" : ""}`} dangerouslySetInnerHTML={{ __html: html }} />;
 });
 
-export function AskPanel({ taskId, onClose }: { taskId: string; onClose: () => void }) {
+export const AskPanel = memo(function AskPanel({ taskId, onClose }: { taskId: string; onClose: () => void }) {
   const [messages, setMessages] = useState<AskMessage[]>([]);
   const [models, setModels] = useState<{ id: string; label: string }[]>([]);
   const [model, setModel] = useState("");
@@ -64,44 +77,64 @@ export function AskPanel({ taskId, onClose }: { taskId: string; onClose: () => v
 
   useEffect(() => {
     let active = true;
-    setMessages([]);
-    setStreaming("");
-    setError(undefined);
-    void api.askHistory(taskId).then((data) => {
-      if (!active) return;
+    /** Snapshot WebSocket selalu menang atas jawaban GET yang datang belakangan. */
+    let fromSocket = false;
+    let buffer = "";
+    let flush: ReturnType<typeof setTimeout> | undefined;
+    const resetStream = () => {
+      if (flush) clearTimeout(flush);
+      flush = undefined;
+      buffer = "";
+      setStreaming("");
+    };
+    const apply = (data: AskSnapshot) => {
       setMessages(data.messages);
       setModels(data.models);
       setModel((current) => current || data.models[0]?.id || "");
       setCost(data.costUsd);
       setBusy(data.busy);
-    });
+    };
+    setMessages([]);
+    setError(undefined);
+    resetStream();
 
-    const source = new EventSource(`/api/tasks/${encodeURIComponent(taskId)}/ask/events`);
-    source.onmessage = (event) => {
+    // Cadangan kalau WebSocket belum/tidak tersambung (mis. proxy tanpa Upgrade).
+    void api
+      .askHistory(taskId)
+      .then((data) => active && !fromSocket && apply(data))
+      .catch(() => undefined);
+
+    const off = subscribe<AskStreamEvent>(`ask:${taskId}`, (event) => {
       if (!active) return;
-      let data:
-        | { type: "delta"; text: string }
-        | { type: "answer"; message: AskMessage }
-        | { type: "busy"; busy: boolean }
-        | { type: "error"; message: string };
-      try {
-        data = JSON.parse(event.data) as typeof data;
-      } catch {
+      if (event.type === "snapshot") {
+        fromSocket = true;
+        resetStream();
+        apply(event);
         return;
       }
-      if (data.type === "delta") setStreaming((previous) => previous + data.text);
-      if (data.type === "answer") {
-        setStreaming("");
-        setMessages((previous) => [...previous, data.message]);
-        setCost((previous) => Number((previous + (data.message.costUsd ?? 0)).toFixed(6)));
+      if (event.type === "delta") {
+        buffer += event.text;
+        if (!flush) {
+          flush = setTimeout(() => {
+            flush = undefined;
+            if (active) setStreaming(buffer);
+          }, STREAM_FLUSH_MS);
+        }
+        return;
       }
-      if (data.type === "busy") setBusy(data.busy);
-      if (data.type === "error") setError(data.message);
-    };
+      if (event.type === "answer") {
+        resetStream();
+        setMessages((previous) => [...previous, event.message]);
+        setCost((previous) => Number((previous + (event.message.costUsd ?? 0)).toFixed(6)));
+      }
+      if (event.type === "busy") setBusy(event.busy);
+      if (event.type === "error") setError(event.message);
+    });
 
     return () => {
       active = false;
-      source.close();
+      if (flush) clearTimeout(flush);
+      off();
     };
   }, [taskId]);
 
@@ -263,4 +296,4 @@ export function AskPanel({ taskId, onClose }: { taskId: string; onClose: () => v
       </div>
     </aside>
   );
-}
+});

@@ -1,9 +1,9 @@
 /** Tabel uji pagar keras. Deterministik, tanpa biaya model: bun run check:policy */
-import { classifyCommand, type PolicyCategory } from "../server/policy.ts";
+import { classifyCommand, commitRequestedIn, type PolicyCategory } from "../server/policy.ts";
 
 const ctx = { workspaceDir: "/var/www/ai-team/workspace", taskDir: "/var/www/ai-team/data/tasks/T-001" };
 
-type Case = [command: string, decision: "deny" | "ask" | "pass", category?: PolicyCategory];
+type Case = [command: string, decision: "deny" | "ask" | "pass", category?: PolicyCategory, commitRequested?: boolean];
 
 const CASES: Case[] = [
   // boleh jalan sendiri
@@ -56,11 +56,42 @@ const CASES: Case[] = [
   ["sudo reboot", "deny"],
   ["ssh host 'shutdown -h now'", "deny"],
   ["psql -c 'DROP DATABASE produksi'", "deny"],
+
+  // git commit — format pesan
+  ['git commit -m "feat: add login"', "pass", undefined, true],
+  ['git commit -m "fix(auth)!: change token format"', "pass", undefined, true],
+  ['git add src/a.ts && git commit -am "chore: bump deps"', "pass", undefined, true],
+  ['git commit -m "tambah login"', "deny", undefined, true],
+  ['git commit -m "Feat: add login"', "deny", undefined, true],
+  ["git commit -m \"$(cat <<'EOF'\nfeat: add login\n\nbody with \"quotes\"\nEOF\n)\"", "pass", undefined, true],
+  ["git commit -m \"$(cat <<'EOF'\ntambah login\nEOF\n)\"", "deny", undefined, true],
+  ["git commit -F - <<'EOF'\ndocs: update readme\nEOF", "pass", undefined, true],
+  ["git commit -F - <<'EOF'\nupdate readme\nEOF", "deny", undefined, true],
+  ["git commit --amend --no-edit", "pass", undefined, true],
+  ['git commit -m "fix: reject -F file flag"', "pass", undefined, true],
+
+  // git commit — atribusi AI & pesan dari berkas
+  ['git commit -m "feat: add login" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"', "deny", undefined, true],
+  ['git commit -m "feat: add login\n\nGenerated with Claude Code"', "deny", undefined, true],
+  ['git commit -m "feat: add login" --trailer "Co-authored-by=Claude <x@y.z>"', "deny", undefined, true],
+  ["git commit -F pesan.txt", "deny", undefined, true],
+  ["git commit --file=pesan.txt", "deny", undefined, true],
+  ["git commit -t template.txt", "deny", undefined, true],
+
+  // git commit — hanya kalau diminta pemilik
+  ['git commit -m "feat: add login"', "deny", undefined, false],
+  ['git -C repo commit -m "feat: add login"', "deny", undefined, false],
+  ['cd repo && git commit -m "feat: add login"', "deny", undefined, false],
+  ['GIT_AUTHOR_NAME=x git commit -m "feat: add login"', "deny", undefined, false],
+  ["git log --grep commit", "pass", undefined, false],
+  ["git diff HEAD~1 -- commit.ts", "pass", undefined, false],
+  ["echo 'git commit belum dijalankan' >> catatan.txt", "pass", undefined, false],
+  ['git commit -m "feat: add login"', "pass"],
 ];
 
 let gagal = 0;
-for (const [command, expected, category] of CASES) {
-  const result = classifyCommand(command, ctx);
+for (const [command, expected, category, commitRequested] of CASES) {
+  const result = classifyCommand(command, { ...ctx, commitRequested });
   const okDecision = result.decision === expected;
   const okCategory = expected !== "ask" || category === undefined || result.category === category;
   const ok = okDecision && okCategory;
@@ -72,5 +103,26 @@ for (const [command, expected, category] of CASES) {
   );
 }
 
-console.log(`\n${CASES.length - gagal}/${CASES.length} kasus sesuai harapan`);
+const REQUEST_CASES: [messages: string[], expected: boolean][] = [
+  [[], false],
+  [["perbaiki bug login"], false],
+  [["perbaiki bug login lalu commit"], true],
+  [["tolong commit ya"], true],
+  [["commitnya sekarang"], true],
+  [["jangan commit dulu"], false],
+  [["perbaiki, jangan di-commit"], false],
+  [["belum perlu commit"], false],
+  [["jangan commit dulu", "oke sekarang commit"], true],
+  [["tolong commit", "jangan commit dulu"], false],
+  [["tolong commit", "lanjutkan perbaikannya"], true],
+];
+
+const total = CASES.length + REQUEST_CASES.length;
+for (const [messages, expected] of REQUEST_CASES) {
+  const ok = commitRequestedIn(messages) === expected;
+  if (!ok) gagal += 1;
+  console.log(`${ok ? "  ok  " : "GAGAL "} ${JSON.stringify(messages).slice(0, 62).padEnd(64)} ${expected}`);
+}
+
+console.log(`\n${total - gagal}/${total} kasus sesuai harapan`);
 if (gagal > 0) process.exitCode = 1;

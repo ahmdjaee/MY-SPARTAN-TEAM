@@ -3,7 +3,8 @@ import { join } from "node:path";
 import { CONFIG } from "./config.ts";
 import { EPHEMERAL_EVENTS, type RoleId, type StoredEvent, type UiEvent } from "./types.ts";
 
-type CachedThread = { events: StoredEvent[]; bytes: number; lastSeq: number };
+/** `dir`: folder tugas sudah pasti ada — mkdirSync tidak perlu diulang di setiap event. */
+type CachedThread = { events: StoredEvent[]; bytes: number; lastSeq: number; dir: boolean };
 
 /** Transcript yang sedang dibuka saja yang ditahan di memori; sisanya dibaca ulang saat dibutuhkan. */
 const MAX_CACHED_TASKS = 6;
@@ -25,8 +26,9 @@ class ThreadStore {
 
   private load(taskId: string): CachedThread {
     const path = this.path(taskId);
-    const entry: CachedThread = { events: [], bytes: 0, lastSeq: 0 };
+    const entry: CachedThread = { events: [], bytes: 0, lastSeq: 0, dir: false };
     if (existsSync(path)) {
+      entry.dir = true;
       for (const line of readFileSync(path, "utf8").split("\n")) {
         if (!line) continue;
         try {
@@ -74,8 +76,10 @@ class ThreadStore {
     const line = JSON.stringify(stored);
     cached.events.push(stored);
     cached.bytes += line.length;
-    const dir = join(CONFIG.tasksDir, taskId);
-    mkdirSync(dir, { recursive: true });
+    if (!cached.dir) {
+      mkdirSync(join(CONFIG.tasksDir, taskId), { recursive: true });
+      cached.dir = true;
+    }
     appendFileSync(this.path(taskId), `${line}\n`);
     return stored;
   }
@@ -94,6 +98,16 @@ class ThreadStore {
     }
     const start = Math.max(0, end - Math.max(0, options.limit));
     return { events: all.slice(start, end), hasMore: start > 0 };
+  }
+
+  /** Event terakhir yang cocok, dicari mundur di seluruh transcript tanpa menyalinnya. */
+  findLast(taskId: string, predicate: (event: StoredEvent) => boolean): StoredEvent | undefined {
+    const all = this.touch(taskId).events;
+    for (let index = all.length - 1; index >= 0; index -= 1) {
+      const event = all[index]!;
+      if (predicate(event)) return event;
+    }
+    return undefined;
   }
 
   /** Event setelah seq tertentu — untuk replay saat klien menyambung ulang. */

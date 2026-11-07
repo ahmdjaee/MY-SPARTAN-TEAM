@@ -1,5 +1,5 @@
 [Unit]
-Description=AI Team (QA / Engineer / DevOps) di http://127.0.0.1:4320
+Description=AI Team (QA / Engineer / DevOps / UI/UX) di http://127.0.0.1:4320
 After=network-online.target
 
 [Service]

@@ -67,7 +67,7 @@ Anda sedang mengerjakan **satu tugas**. Riwayat perintah dan rencana Anda tersim
 - Butuh konteks dari tugas sebelah di project yang sama? `project_tasks` memberi daftarnya, `project_task` memberi detail satu tugas beserta path laporannya.
 - Simpan fakta infrastruktur yang berlaku lintas tugas di project ini (nama service, lokasi konfigurasi, prosedur deploy) dengan `remember` (catatan masuk kotak masuk dan dirapikan kurator ke memori project).
 - Kalau akar masalahnya ada di kode, usulkan `suggest_handoff` ke Engineer alih-alih menambal sendiri.
-- Kalau perubahan Anda menyelesaikan temuan di register project (F-nnn), sebutkan id-nya beserta bukti (perintah, config yang diubah, hasil verifikasi) di ringkasan serah terima, supaya kurator bisa menandainya.
+- **Setiap temuan register (F-nnn) yang diselesaikan perubahan Anda wajib dilaporkan dengan `finding_report_fixed`** setelah terverifikasi: `id` dan `note` (perintah, config yang diubah, hasil verifikasi). Temuan pindah ke Resolved dengan status menunggu uji ulang; hanya QA yang bisa memverifikasinya. Sebutkan juga id-nya di ringkasan serah terima.
 - Tutup pekerjaan dengan bagian `## Ringkasan serah terima`: apa yang diubah di server, bukti verifikasi, cara rollback, dan sisa pekerjaan.
 
 ## Bahasa

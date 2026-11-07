@@ -28,10 +28,6 @@ export function App() {
   const [projects, setProjects] = useState<ProjectInfo[]>([]);
   const [workspaceDir, setWorkspaceDir] = useState("");
   const [targetUrl, setTargetUrl] = useState("");
-  const [account, setAccount] = useState<{
-    email?: string;
-    subscriptionType?: string;
-  } | null>();
   const [settings, setSettings] = useState<SettingsData>();
   const settingsRef = useRef<SettingsData | undefined>(undefined);
   const [creating, setCreating] = useState(false);
@@ -156,21 +152,15 @@ export function App() {
     lastTasksJson.current = "";
   }, [filterRole, filterStatus, filterProject]);
 
-  // Sumber utama pembaruan daftar adalah event `tasks_changed` dari server (di bawah);
-  // interval ini hanya cadangan, dan diam saat tab tidak terlihat.
+  // Pembaruan daftar datang dari event `tasks_changed` (WebSocket, di bawah) — termasuk saat
+  // sambungan pulih. Tab yang terlihat lagi tetap memuat ulang, kalau-kalau sambungannya sedang putus.
   useEffect(() => {
     loadTasks();
-    const timer = setInterval(() => {
-      if (!document.hidden) loadTasks();
-    }, 30_000);
     const onVisible = () => {
       if (!document.hidden) loadTasks();
     };
     document.addEventListener("visibilitychange", onVisible);
-    return () => {
-      clearInterval(timer);
-      document.removeEventListener("visibilitychange", onVisible);
-    };
+    return () => document.removeEventListener("visibilitychange", onVisible);
   }, [loadTasks]);
 
   useEffect(() => {
@@ -183,10 +173,6 @@ export function App() {
       setWorkspaceDir(data.workspaceDir);
       setTargetUrl(data.targetUrl);
     });
-    void api
-      .auth()
-      .then((data) => setAccount(data.account))
-      .catch(() => setAccount(null));
     void api.settings().then((data) => {
       setSettings(data);
       settingsRef.current = data;
@@ -278,13 +264,6 @@ export function App() {
             </button>
             <div className="min-w-0">
               <h1 className="text-sm font-semibold tracking-wide text-ink">AI TEAM</h1>
-              {/* <p className="truncate text-[11px] text-muted">
-              {account === undefined
-                ? "memeriksa sesi…"
-                : account
-                  ? `${account.email} · ${account.subscriptionType ?? "?"}`
-                  : "sesi Claude tidak terdeteksi"}
-            </p> */}
             </div>
             <button
               onClick={() => setCreating(true)}

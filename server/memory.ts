@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { CONFIG } from "./config.ts";
 
 const MAX_BULLETS = 200;
@@ -98,6 +98,9 @@ export function readMemory(): string {
 
 export function writeMemory(text: string): string {
   const trimmed = trimMemory(text);
-  writeFileSync(CONFIG.memoryPath, trimmed);
+  // Atomik (tmp + rename): server mati di tengah penulisan tidak meninggalkan memori setengah jadi.
+  const tmp = `${CONFIG.memoryPath}.tmp`;
+  writeFileSync(tmp, trimmed);
+  renameSync(tmp, CONFIG.memoryPath);
   return trimmed;
 }

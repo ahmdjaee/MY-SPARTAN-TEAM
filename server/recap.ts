@@ -138,15 +138,54 @@ const VERDICTS: RecapVerdict[] = [
 const HASIL_RE = /^[ \t]*[-*]?[ \t]*\*\*Hasil:?\*\*[ \t]*:?[ \t]*(.+)$/gim;
 
 /**
- * Verdict dari baris "**Hasil:**" **terakhir** di berkas — satu report.md bisa memuat
- * beberapa bagian, dan yang berlaku adalah kesimpulan peran yang menulis paling akhir.
+ * Verdict dari baris "**Hasil:**" terakhir yang memuat kata verdict. Satu report.md bisa memuat
+ * beberapa bagian, dan yang berlaku adalah kesimpulan peran yang menulis paling akhir. Baris
+ * "**Hasil:**" di ringkasan serah terima berisi kalimat bebas, jadi tidak boleh menghapus verdict.
  */
 export function verdictOf(text: string): RecapVerdict | undefined {
-  let last: string | undefined;
-  for (const match of text.matchAll(HASIL_RE)) if (match[1]) last = match[1];
-  if (!last) return undefined;
-  const value = plain(last).toUpperCase();
-  return VERDICTS.find((verdict) => value.startsWith(verdict.text));
+  let found: RecapVerdict | undefined;
+  for (const match of text.matchAll(HASIL_RE)) {
+    const value = plain(match[1] ?? "").toUpperCase();
+    found = VERDICTS.find((verdict) => value.startsWith(verdict.text)) ?? found;
+  }
+  return found;
+}
+
+/** Urai isi heading temuan, mis. "T-1 · judul · major (bawaan) · ref F-012". */
+function parseFindingHead(text: string): RecapFinding {
+  let ref: string | undefined;
+  let refNote: string | undefined;
+  const parts = text
+    .split("·")
+    .map(plain)
+    .filter(Boolean)
+    .filter((part) => {
+      const match = /^ref[ \t:]*(F-\d+)(?:[ \t]*\((.*)\))?$/i.exec(part);
+      if (match?.[1]) {
+        ref = match[1].toUpperCase();
+        refNote = match[2]?.trim() || undefined;
+      }
+      return !match;
+    });
+  // Keterangan kadang jadi bagian sendiri sesudah severity: "· minor · (kelas sama dengan F-001)".
+  let afterSeverity: string | undefined;
+  const last = parts[parts.length - 1] ?? "";
+  if (/^\(.*\)$/.test(last) && /^(blocker|major|minor)$/i.test(parts[parts.length - 2] ?? "")) {
+    afterSeverity = last.slice(1, -1).trim();
+    parts.pop();
+  }
+  let severity: RecapSeverity = "lain";
+  let note: string | undefined;
+  // Severity sering diikuti keterangan: "· minor (bawaan, identik)".
+  const tail = /^(blocker|major|minor)\b[ \t]*(.*)$/i.exec(parts[parts.length - 1] ?? "");
+  if (tail?.[1]) {
+    severity = tail[1].toLowerCase() as RecapSeverity;
+    note = tail[2]?.trim().replace(/^\((.*)\)$/, "$1") || afterSeverity || refNote;
+    parts.pop();
+  }
+  let id: string | undefined;
+  if (parts.length > 1 && /^T-\d+$/i.test(parts[0] ?? "")) id = parts.shift()?.toUpperCase();
+  return { id, title: parts.join(" · ") || "(tanpa judul)", severity, note, ref };
 }
 
 export function findingsOf(text: string): RecapFinding[] {
@@ -158,42 +197,82 @@ export function findingsOf(text: string): RecapFinding[] {
   for (const line of body.split("\n")) {
     const head = /^#{3,6}[ \t]+(.+?)[ \t]*$/.exec(line);
     if (!head?.[1]) continue;
-    let ref: string | undefined;
-    let refNote: string | undefined;
-    const parts = head[1]
-      .split("·")
-      .map(plain)
-      .filter(Boolean)
-      .filter((part) => {
-        const match = /^ref[ \t:]*(F-\d+)(?:[ \t]*\((.*)\))?$/i.exec(part);
-        if (match?.[1]) {
-          ref = match[1].toUpperCase();
-          refNote = match[2]?.trim() || undefined;
-        }
-        return !match;
-      });
-    // Keterangan kadang jadi bagian sendiri sesudah severity: "· minor · (kelas sama dengan F-001)".
-    let afterSeverity: string | undefined;
-    const last = parts[parts.length - 1] ?? "";
-    if (/^\(.*\)$/.test(last) && /^(blocker|major|minor)$/i.test(parts[parts.length - 2] ?? "")) {
-      afterSeverity = last.slice(1, -1).trim();
-      parts.pop();
-    }
-    let severity: RecapSeverity = "lain";
-    let note: string | undefined;
-    // Severity sering diikuti keterangan: "· minor (bawaan, identik)".
-    const tail = /^(blocker|major|minor)\b[ \t]*(.*)$/i.exec(parts[parts.length - 1] ?? "");
-    if (tail?.[1]) {
-      severity = tail[1].toLowerCase() as RecapSeverity;
-      note = tail[2]?.trim().replace(/^\((.*)\)$/, "$1") || afterSeverity || refNote;
-      parts.pop();
-    }
-    let id: string | undefined;
-    if (parts.length > 1 && /^T-\d+$/i.test(parts[0] ?? "")) id = parts.shift()?.toUpperCase();
-    findings.push({ id, title: parts.join(" · ") || "(tanpa judul)", severity, note, ref });
+    findings.push(parseFindingHead(head[1]));
     if (findings.length >= FINDINGS_MAX) break;
   }
   return findings;
+}
+
+/** Heading markdown di luar blok kode, beserta posisinya. */
+function headingsOf(text: string): Array<{ level: number; title: string; start: number; end: number }> {
+  const found: Array<{ level: number; title: string; start: number; end: number }> = [];
+  let fence = false;
+  let offset = 0;
+  for (const line of text.split("\n")) {
+    if (/^\s{0,3}(```|~~~)/.test(line)) fence = !fence;
+    const head = fence ? null : /^(#{1,6})[ \t]+(.+?)[ \t]*$/.exec(line);
+    if (head?.[1] && head[2]) found.push({ level: head[1].length, title: head[2], start: offset, end: offset + line.length });
+    offset += line.length + 1;
+  }
+  return found;
+}
+
+export type ReportRound = { title: string; verdict?: RecapVerdict; body: string };
+
+const ROUND_TITLE_RE = /^(uji ulang|perbaikan|commit perbaikan|penerapan)\b/i;
+const HAS_RESULT_RE = /^[ \t]*[-*]?[ \t]*\*\*Hasil:?\*\*/im;
+
+/**
+ * Pecah report.md jadi putaran kerja (laporan awal, perbaikan, uji ulang) menurut urutan berkas.
+ * Putaran baru dimulai pada heading "## " yang bagiannya punya baris "**Hasil:**" atau berjudul uji
+ * ulang/perbaikan, karena judulnya bebas. "Ringkasan serah terima" tetap milik putaran sebelumnya.
+ * Tidak ada teks yang dibuang: gabungan semua `body` sama dengan berkas aslinya.
+ */
+export function reportRounds(text: string): ReportRound[] {
+  if (!text.trim()) return [];
+  const headings = headingsOf(text);
+  const majors = headings.filter((heading) => heading.level <= 2);
+  const starts: Array<{ at: number; title?: string }> = [{ at: 0, title: headings.find((heading) => heading.level === 1)?.title }];
+  // Laporan yang baris Hasil-nya baru muncul di dalam "## " pertama tetap satu putaran awal.
+  let firstHasResult = HAS_RESULT_RE.test(text.slice(0, majors.find((heading) => heading.level === 2)?.start ?? text.length));
+  majors.forEach((heading, index) => {
+    if (heading.level !== 2) return;
+    const section = text.slice(heading.end, majors[index + 1]?.start ?? text.length);
+    const title = plain(heading.title);
+    if (/^ringkasan serah terima\b/i.test(title)) return;
+    // Bagian uji ulang atau perbaikan kadang tidak punya baris Hasil sendiri (T-017).
+    if (!HAS_RESULT_RE.test(section) && !ROUND_TITLE_RE.test(title)) return;
+    if (!firstHasResult) {
+      firstHasResult = true;
+      return;
+    }
+    starts.push({ at: heading.start, title: heading.title });
+  });
+  return starts.map((start, index) => {
+    const body = text.slice(start.at, starts[index + 1]?.at ?? text.length);
+    return { title: plain(start.title ?? "Laporan awal"), verdict: verdictOf(body), body };
+  });
+}
+
+export type FindingHead = RecapFinding & { heading: string; body: string };
+
+/**
+ * Semua blok temuan di laporan: heading ber-severity, bernomor T-n, atau ber-ref F-nnn, di bagian
+ * mana pun. Sengaja tidak terikat "## Temuan" karena di laporan nyata judulnya bervariasi ("## Temuan (BUG)").
+ */
+export function findingHeads(text: string): FindingHead[] {
+  const headings = headingsOf(text);
+  const heads: FindingHead[] = [];
+  headings.forEach((heading, index) => {
+    if (heading.level < 3) return;
+    const finding = parseFindingHead(heading.title);
+    // Laporan lama memakai "T-1 — judul (tinggi)", tanpa pemisah yang dikenali parser.
+    const id = finding.id ?? /^T-\d+\b/i.exec(plain(heading.title))?.[0].toUpperCase();
+    if (!id && !finding.ref && finding.severity === "lain") return;
+    const next = headings.slice(index + 1).find((other) => other.level <= heading.level);
+    heads.push({ ...finding, id, heading: plain(heading.title), body: text.slice(heading.end, next?.start ?? text.length).trim() });
+  });
+  return heads;
 }
 
 function reportChangedAt(taskId: string, fallback: string): string {

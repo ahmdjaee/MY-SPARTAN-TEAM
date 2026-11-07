@@ -1,4 +1,4 @@
-import { OPEN_STATUSES, appendInbox, getFinding, readInbox, readRegister, readState, registerDigest, type FindingStatus } from "./findings.ts";
+import { OPEN_STATUSES, appendInbox, getFinding, readInbox, readRegister, readState, recordRetest, registerDigest, reportFixed, type FindingStatus } from "./findings.ts";
 import { readMemory } from "./memory.ts";
 import {
   defaultProjectId,
@@ -258,6 +258,30 @@ export function findingDetailFor(taskId: string, id: string): ToolAnswer {
     }
   }
   return { text: parts.join("\n") };
+}
+
+/** Tool `finding_report_fixed`: Engineer/DevOps melapor sudah memperbaiki satu temuan. */
+export function reportFixedFor(taskId: string, id: string, note: string, commit?: string): ToolAnswer {
+  const project = projectOfTask(taskId);
+  if (!project) return { text: "ERROR: tugas ini belum punya project", isError: true };
+  try {
+    const finding = reportFixed(project.id, id, { taskId, note, commit });
+    return { text: `${finding.id} sekarang menunggu uji ulang QA.` };
+  } catch (error) {
+    return { text: `ERROR: ${(error as Error).message}`, isError: true };
+  }
+}
+
+/** Tool `finding_retest`: QA mencatat hasil uji ulang satu temuan. */
+export function recordRetestFor(taskId: string, id: string, passed: boolean, note: string, evidence: string): ToolAnswer {
+  const project = projectOfTask(taskId);
+  if (!project) return { text: "ERROR: tugas ini belum punya project", isError: true };
+  try {
+    const finding = recordRetest(project.id, id, { taskId, passed, note, evidence });
+    return { text: `${finding.id} sekarang ${finding.status === "fixed" ? "terverifikasi diperbaiki" : "terbuka"}.` };
+  } catch (error) {
+    return { text: `ERROR: ${(error as Error).message}`, isError: true };
+  }
 }
 
 /** Potongan transcript yang dikirim ke panel Tanya: cukup untuk paham, tidak sampai membengkak. */

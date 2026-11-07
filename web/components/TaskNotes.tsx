@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { api } from "../api.ts";
 import { MarkdownEditor, isEditorView, type EditorView } from "./MarkdownEditor.tsx";
@@ -11,7 +11,10 @@ const NOTE =
  * disunting, catatan ditulis sambil berpindah-pindah tab — jadi draf yang belum
  * disimpan ikut terkirim saat komponen ditinggalkan atau halaman ditutup.
  */
-export function TaskNotes({ taskId, onSaved }: { taskId: string; onSaved: () => void }) {
+/** Batas body `fetch(..., { keepalive })` di browser 64 KiB; di atas itu fetch-nya langsung gagal. */
+const KEEPALIVE_MAX_BYTES = 60_000;
+
+export const TaskNotes = memo(function TaskNotes({ taskId, onSaved }: { taskId: string; onSaved: () => void }) {
   const [text, setText] = useState<string>();
   const [search, setSearch] = useSearchParams();
   const viewFromUrl = search.get("view");
@@ -41,14 +44,23 @@ export function TaskNotes({ taskId, onSaved }: { taskId: string; onSaved: () => 
   const flush = (keepalive = false) => {
     const { taskId: id, saved, draft } = pending.current;
     if (draft === saved) return;
-    pending.current.saved = draft;
+    const body = JSON.stringify({ text: draft });
+    // Catatan besar dikirim tanpa keepalive: kalau halaman ditutup, permintaannya bisa terputus,
+    // tapi dengan keepalive ia pasti gagal (dulu hilang diam-diam).
+    const small = new Blob([body]).size <= KEEPALIVE_MAX_BYTES;
     void fetch(`/api/tasks/${encodeURIComponent(id)}/notes`, {
       method: "PUT",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ text: draft }),
-      keepalive,
+      body,
+      keepalive: keepalive && small,
     })
-      .then(() => onSavedRef.current())
+      .then((response) => {
+        if (!response.ok) return;
+        // Baru dianggap tersimpan setelah server menerimanya; gagal → dicoba lagi di flush berikutnya.
+        // Penyimpanan yang lebih baru (atau pindah tugas) tidak boleh ditimpa jawaban yang lebih lama.
+        if (pending.current.taskId === id && pending.current.saved === saved) pending.current.saved = draft;
+        onSavedRef.current();
+      })
       .catch(() => undefined);
   };
 
@@ -90,4 +102,4 @@ export function TaskNotes({ taskId, onSaved }: { taskId: string; onSaved: () => 
       />
     </div>
   );
-}
+});

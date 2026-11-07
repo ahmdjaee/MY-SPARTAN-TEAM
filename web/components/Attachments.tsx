@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { api, docRawUrl, type DocContent, type DocInfo } from "../api.ts";
 import { renderMarkdown } from "../markdown.ts";
@@ -26,8 +26,14 @@ function groupByFolder(docs: DocInfo[]): { folder: string; docs: DocInfo[] }[] {
   return groups;
 }
 
+/** Berkas s.d. 512 KB di-parse sekali per isi, bukan setiap kali induknya render (mis. saat agen streaming). */
+const MarkdownDoc = memo(function MarkdownDoc({ text, taskId }: { text: string; taskId: string }) {
+  const html = useMemo(() => renderMarkdown(text, taskId), [text, taskId]);
+  return <div className="markdown" dangerouslySetInnerHTML={{ __html: html }} />;
+});
+
 /** Lampiran tugas: berkas teks di folder tugas selain report.md dan gambar bukti. */
-export function Attachments({ taskId, docs }: { taskId: string; docs: DocInfo[] }) {
+export const Attachments = memo(function Attachments({ taskId, docs }: { taskId: string; docs: DocInfo[] }) {
   const [content, setContent] = useState<DocContent>();
   const [error, setError] = useState<string>();
   // Pindah-pindah berkas tidak perlu memanggil server lagi.
@@ -142,7 +148,7 @@ export function Attachments({ taskId, docs }: { taskId: string; docs: DocInfo[] 
           )}
           {content?.text !== undefined &&
             (isMarkdown ? (
-              <div className="markdown" dangerouslySetInnerHTML={{ __html: renderMarkdown(content.text, taskId) }} />
+              <MarkdownDoc text={content.text} taskId={taskId} />
             ) : (
               <pre className="overflow-x-auto rounded-lg border border-line bg-page p-3 font-mono text-xs leading-relaxed text-ink">
                 {content.text}
@@ -152,4 +158,4 @@ export function Attachments({ taskId, docs }: { taskId: string; docs: DocInfo[] 
       </section>
     </div>
   );
-}
+});

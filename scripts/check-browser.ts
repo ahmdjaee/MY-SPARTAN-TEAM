@@ -6,6 +6,7 @@
  * sel ber-ellipsis, tombol hapus dengan `confirm()`, select, dan tooltip hover.
  */
 import { chromium } from "playwright";
+import { BrowserSession } from "../server/browser/mcp.ts";
 import { DialogWatcher, formatInspect, inspect, readText, scroll, verdictLines } from "../server/browser/ops.ts";
 
 const FIXTURE = `<!doctype html><meta charset="utf-8"><title>fixture QA</title>
@@ -189,6 +190,98 @@ await check("inspect selector tidak ada: pesan error yang jelas", async () => {
     return need(String(error).includes("tidak ada elemen"), String(error));
   }
 });
+
+// 9. Gaya visual untuk audit UI/UX: angkanya dihitung, atau jujur bilang tidak bisa.
+const VISUAL = `<!doctype html><meta charset="utf-8">
+<body style="margin:0;background:#fff;color:#000">
+<p id="hitam">hitam di putih</p>
+<p id="abu" style="color:#777">abu-abu di putih</p>
+<div style="background:#111"><p id="gelap" style="color:#fff">putih di ancestor gelap</p></div>
+<p id="oklch" style="color:oklch(0 0 0)">warna oklch</p>
+<p id="alpha" style="color:rgba(0,0,0,.5)">teks setengah transparan</p>
+<div style="background:rgba(0,0,0,.5)"><p id="latar-alpha" style="color:#fff">background setengah transparan</p></div>
+<div style="background:linear-gradient(#000,#fff)"><p id="gradient">di atas gradient</p></div>
+<div style="opacity:.5"><p id="redup">di dalam opacity</p></div>
+<p id="besar" style="color:#777;font-size:24px">teks besar</p>
+<div id="wadah"><span>teks ada di anak</span></div>
+</body>`;
+await page.setContent(VISUAL);
+
+const visual = async (selector: string) => {
+  const [report] = await inspect(page, selector);
+  if (!report) throw new Error(`tidak ada laporan untuk ${selector}`);
+  return report.visual;
+};
+
+await check("kontras: hitam di putih = 21:1", async () => {
+  const { contrast, color, background } = await visual("#hitam");
+  return need(contrast === 21 && color === "#000000" && background === "#ffffff", `${contrast} ${color} ${background}`);
+});
+
+await check("kontras: #777 di putih gagal AA dan dibulatkan ke bawah (4,47 < 4,5)", async () => {
+  const { contrast, contrastTarget } = await visual("#abu");
+  return need(contrast === 4.47 && contrastTarget === 4.5, `${contrast} target ${contrastTarget}`);
+});
+
+await check("kontras: background diambil dari ancestor", async () => {
+  const { contrast, background } = await visual("#gelap");
+  return need(background === "#111111" && contrast === 18.88, `${contrast} ${background}`);
+});
+
+await check("kontras: warna oklch() terbaca", async () => {
+  const { contrast } = await visual("#oklch");
+  return need(contrast === 21, `${contrast}`);
+});
+
+await check("kontras: teks transparan dicampur dengan background", async () => {
+  const { contrast } = await visual("#alpha");
+  return need(contrast !== undefined && contrast > 3.9 && contrast < 4.1, `${contrast}`);
+});
+
+await check("kontras: background transparan dicampur dengan lapisan bawahnya", async () => {
+  const { contrast, background } = await visual("#latar-alpha");
+  // Alpha 0,5 dibaca canvas sebagai 127 atau 128 dari 255, jadi hasilnya boleh meleset satu angka.
+  return need(/^#(7f7f7f|808080)$/.test(background ?? "") && contrast !== undefined && contrast > 3.9 && contrast < 4.1, `${contrast} ${background}`);
+});
+
+await check("kontras: gradient tidak dihitung", async () => {
+  const { contrast, background, contrastNote } = await visual("#gradient");
+  return need(contrast === undefined && background === undefined && /gradient/.test(contrastNote ?? ""), `${contrast} ${contrastNote}`);
+});
+
+await check("kontras: opacity pada ancestor tidak dihitung", async () => {
+  const { contrast, contrastNote } = await visual("#redup");
+  return need(contrast === undefined && /opacity/.test(contrastNote ?? ""), `${contrast} ${contrastNote}`);
+});
+
+await check("kontras: teks besar memakai batas 3:1", async () => {
+  const { contrast, contrastTarget } = await visual("#besar");
+  return need(contrast === 4.47 && contrastTarget === 3, `${contrast} target ${contrastTarget}`);
+});
+
+await check("kontras: elemen tanpa teks langsung tidak diberi angka", async () => {
+  const { contrast, contrastNote } = await visual("#wadah");
+  return need(contrast === undefined && /teks langsung/.test(contrastNote ?? ""), `${contrast} ${contrastNote}`);
+});
+
+await check("formatInspect: vonis AA tertulis", async () => {
+  const gagalAa = formatInspect(await inspect(page, "#abu"), "#abu");
+  const lolosAa = formatInspect(await inspect(page, "#hitam"), "#hitam");
+  return need(gagalAa.includes("GAGAL AA") && lolosAa.includes("lolos AA"), `${gagalAa}\n${lolosAa}`);
+});
+
+// 10. Viewport berubah pada open kedua. Dulu diam-diam tetap memakai ukuran pertama.
+const session = new BrowserSession(() => undefined);
+await check("BrowserSession: viewport mengikuti permintaan terakhir", async () => {
+  const width = async (page: Awaited<ReturnType<BrowserSession["getPage"]>>) => await page.evaluate("window.innerWidth");
+  const pertama = await width(await session.getPage({ width: 1440, height: 900 }));
+  const kedua = await width(await session.getPage({ width: 390, height: 844 }));
+  const tanpaUkuran = await width(await session.getPage());
+  return need(pertama === 1440 && kedua === 390 && tanpaUkuran === 390, `${pertama} → ${kedua} → ${tanpaUkuran}`);
+});
+await session.close();
+
+await page.setContent(FIXTURE);
 
 console.log("\nContoh keluaran inspect yang dibaca QA:\n");
 console.log(formatInspect(await inspect(page, "#t"), "#t"));

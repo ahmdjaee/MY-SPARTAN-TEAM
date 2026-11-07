@@ -1,16 +1,33 @@
-import { useEffect, useState } from "react";
+import { memo, useEffect, useMemo, useState } from "react";
 import { api } from "../api.ts";
 
-export function Diff({ projectId }: { projectId?: string }) {
+/** Diff besar (s.d. 8 MB) tidak dirender sekaligus: satu <div> per baris membuat tab ini berat. */
+const LINE_LIMIT = 3_000;
+
+function lineClass(line: string): string {
+  if (line.startsWith("+") && !line.startsWith("+++")) return "text-tag-green-ink";
+  if (line.startsWith("-") && !line.startsWith("---")) return "text-tag-red-ink";
+  if (line.startsWith("@@")) return "text-tag-blue-ink";
+  return "text-muted";
+}
+
+export const Diff = memo(function Diff({ projectId }: { projectId?: string }) {
   const [data, setData] = useState<Awaited<ReturnType<typeof api.diff>>>();
   const [tick, setTick] = useState(0);
+  const [showAll, setShowAll] = useState(false);
+  const lines = useMemo(() => (data?.diff.trim() || "tidak ada diff").split("\n"), [data?.diff]);
+  const shown = showAll ? lines : lines.slice(0, LINE_LIMIT);
 
   useEffect(() => {
     let active = true;
     setData(undefined);
     void api
       .diff(projectId)
-      .then((next) => active && setData(next))
+      .then((next) => {
+        if (!active) return;
+        setShowAll(false);
+        setData(next);
+      })
       .catch(() => undefined);
     return () => {
       active = false;
@@ -45,25 +62,23 @@ export function Diff({ projectId }: { projectId?: string }) {
           </pre>
           <h3 className="mt-5 text-xs uppercase tracking-wide text-muted">git diff</h3>
           <pre className="mt-2 overflow-x-auto rounded-lg border border-line bg-page p-3 font-mono text-xs leading-relaxed">
-            {(data.diff.trim() || "tidak ada diff").split("\n").map((line, index) => (
-              <div
-                key={index}
-                className={
-                  line.startsWith("+") && !line.startsWith("+++")
-                    ? "text-tag-green-ink"
-                    : line.startsWith("-") && !line.startsWith("---")
-                      ? "text-tag-red-ink"
-                      : line.startsWith("@@")
-                        ? "text-tag-blue-ink"
-                        : "text-muted"
-                }
-              >
+            {shown.map((line, index) => (
+              <div key={index} className={lineClass(line)}>
                 {line || " "}
               </div>
             ))}
           </pre>
+          {shown.length < lines.length && (
+            <button
+              type="button"
+              onClick={() => setShowAll(true)}
+              className="mt-2 rounded-lg border border-line-strong px-3 py-1.5 text-xs text-ink hover:bg-hover"
+            >
+              Tampilkan semua ({lines.length.toLocaleString("id-ID")} baris)
+            </button>
+          )}
         </>
       )}
     </div>
   );
-}
+});

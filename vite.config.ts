@@ -10,7 +10,8 @@ export default defineConfig({
     host: "127.0.0.1",
     port: 4321,
     proxy: {
-      "/api": { target: "http://127.0.0.1:4320", changeOrigin: true },
+      // ws: true → WebSocket /api/ws ikut diteruskan (satu sambungan per tab untuk semua event live).
+      "/api": { target: "http://127.0.0.1:4320", changeOrigin: true, ws: true },
       "/demo": { target: "http://127.0.0.1:4320", changeOrigin: true },
     },
   },

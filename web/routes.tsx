@@ -20,7 +20,7 @@ export function isTab(value: string | undefined): value is Tab {
   return TABS.includes(value as Tab);
 }
 
-export const ROLE_IDS: RoleId[] = ["qa", "engineer", "devops"];
+export const ROLE_IDS: RoleId[] = ["qa", "engineer", "devops", "uiux"];
 export const STATUSES = Object.keys(STATUS_LABEL) as TaskStatus[];
 
 /**

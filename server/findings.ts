@@ -9,6 +9,7 @@
 import { createHash } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { notifyProject } from "./changes.ts";
 import { projectDir } from "./projects.ts";
 import type { RecapEntry, RecapSeverity } from "./recap.ts";
 import { ACTIVE_STATUSES, reportPath, tasksInProject } from "./tasks.ts";
@@ -36,6 +37,22 @@ export type FindingResolution = {
   at: string;
 };
 
+export type FindingFix = {
+  /** Hash commit, atau id tugas kalau belum di-commit. */
+  by: string;
+  taskId: string;
+  note: string;
+  at: string;
+};
+
+export type FindingRetest = {
+  taskId: string;
+  passed: boolean;
+  note: string;
+  evidence: string;
+  at: string;
+};
+
 export type Finding = {
   id: string;
   title: string;
@@ -47,6 +64,12 @@ export type Finding = {
   resolution?: FindingResolution;
   /** Id temuan lain kalau item ini digabung ke sana (status jadi invalid). */
   mergedInto?: string;
+  /** Laporan perbaikan terakhir dari Engineer/DevOps; belum berarti terbukti. */
+  fix?: FindingFix;
+  /** Hasil uji ulang QA terakhir. */
+  retest?: FindingRetest;
+  /** Diisi saat uji ulang membuktikan perbaikan gagal; dihapus lagi saat uji ulang berikutnya lolos. */
+  reopenedAt?: string;
   createdAt: string;
   updatedAt: string;
   lastVerifiedAt?: string;
@@ -152,6 +175,7 @@ export function readRegister(projectId: string): Register {
 
 function writeRegister(projectId: string, register: Register): void {
   writeAtomic(file(projectId, "findings.json"), JSON.stringify(register, null, 2));
+  notifyProject(projectId);
 }
 
 export function getFinding(projectId: string, id: string): Finding | undefined {
@@ -254,6 +278,84 @@ export function setFindingStatus(
   return next;
 }
 
+function findingToChange(register: Register, id: string): { index: number; finding: Finding } {
+  const index = register.findings.findIndex((finding) => finding.id === id.trim().toUpperCase());
+  const finding = register.findings[index];
+  if (!finding) throw new Error(`temuan ${id} tidak ada di register`);
+  if (finding.mergedInto) throw new Error(`${finding.id} sudah digabung ke ${finding.mergedInto}; pakai id itu`);
+  return { index, finding };
+}
+
+/** Engineer/DevOps melapor sudah memperbaiki: temuan menunggu uji ulang QA, belum dianggap selesai. */
+export function reportFixed(projectId: string, id: string, input: { taskId: string; note: string; commit?: string }): Finding {
+  const note = input.note.trim();
+  if (!note) throw new Error("catatan perbaikan wajib diisi");
+  const register = readRegister(projectId);
+  const { index, finding: before } = findingToChange(register, id);
+  if (!OPEN_STATUSES.includes(before.status)) {
+    throw new Error(`${before.id} berstatus ${before.status}; temuan yang sudah ditutup tidak bisa dilaporkan diperbaiki`);
+  }
+  const stamp = now();
+  const next: Finding = {
+    ...before,
+    status: "needs_retest",
+    fix: { by: input.commit?.trim() || input.taskId, taskId: input.taskId, note, at: stamp },
+    updatedAt: stamp,
+  };
+  register.findings[index] = next;
+  writeRegister(projectId, register);
+  appendLog(projectId, { by: input.taskId, action: "status", target: next.id, detail: `${before.status} → needs_retest — ${note}`, before });
+  return next;
+}
+
+/**
+ * Hasil uji ulang QA. Lolos menutup temuan sebagai terverifikasi. Gagal membuka lagi temuan yang
+ * sudah dilaporkan diperbaiki dan menandainya regresi; temuan yang memang masih terbuka tetap terbuka.
+ */
+export function recordRetest(
+  projectId: string,
+  id: string,
+  input: { taskId: string; passed: boolean; note: string; evidence: string },
+): Finding {
+  const note = input.note.trim();
+  const evidence = input.evidence.trim();
+  if (!note || !evidence) throw new Error("catatan dan bukti uji ulang wajib diisi");
+  const register = readRegister(projectId);
+  const { index, finding: before } = findingToChange(register, id);
+  if (before.status === "wontfix" || before.status === "invalid") {
+    throw new Error(`${before.id} berstatus ${before.status}; temuan ini tidak perlu diuji ulang`);
+  }
+  const stamp = now();
+  const retest: FindingRetest = { taskId: input.taskId, passed: input.passed, note, evidence, at: stamp };
+  const next: Finding = input.passed
+    ? {
+        ...before,
+        status: "fixed",
+        retest,
+        resolution: { by: input.taskId, note: `${note} (bukti: ${evidence})`, at: stamp },
+        lastVerifiedAt: stamp,
+        reopenedAt: undefined,
+        updatedAt: stamp,
+      }
+    : {
+        ...before,
+        status: "open",
+        retest,
+        reopenedAt: before.status === "open" ? before.reopenedAt : stamp,
+        updatedAt: stamp,
+      };
+  register.findings[index] = next;
+  writeRegister(projectId, register);
+  appendLog(projectId, {
+    by: input.taskId,
+    action: "status",
+    target: next.id,
+    detail: `${before.status} → ${next.status} — uji ulang ${input.passed ? "lolos" : "gagal"}: ${note}`,
+    before,
+  });
+  return next;
+}
+
 /** Gabungkan duplikat: kemunculan pindah ke induk, item duplikat ditandai invalid. */
 export function mergeFinding(projectId: string, duplicateId: string, intoId: string, actor: string): Finding {
   const register = readRegister(projectId);
@@ -316,6 +418,8 @@ export function writeState(projectId: string, text: string, by: string): string 
 export function appendLog(projectId: string, entry: Omit<LogEntry, "at">): void {
   mkdirSync(projectDir(projectId), { recursive: true });
   appendFileSync(file(projectId, "curation-log.jsonl"), `${JSON.stringify({ at: now(), ...entry })}\n`);
+  // Cakupan, kesimpulan, dan pembatalan selalu diikuti entri log — cukup diberi tahu di sini.
+  notifyProject(projectId);
 }
 
 export function readLog(projectId: string, limit = 50): LogEntry[] {
@@ -392,6 +496,7 @@ export function appendInbox(projectId: string, taskId: string, note: string): In
   const item = { at: now(), taskId, note: note.replace(/\s+/g, " ").trim() };
   mkdirSync(projectDir(projectId), { recursive: true });
   appendFileSync(file(projectId, "memory-inbox.jsonl"), `${JSON.stringify(item)}\n`);
+  notifyProject(projectId);
   return item;
 }
 
@@ -403,6 +508,7 @@ export function readInbox(projectId: string): InboxNote[] {
 export function dropInbox(projectId: string, upTo: string): void {
   const rest = readInbox(projectId).filter((item) => item.at > upTo);
   writeAtomic(file(projectId, "memory-inbox.jsonl"), rest.map((item) => JSON.stringify(item)).join("\n") + (rest.length ? "\n" : ""));
+  notifyProject(projectId);
 }
 
 // ---------- status kurasi ----------
@@ -413,6 +519,7 @@ export function readCuration(projectId: string): CurationState {
 
 export function writeCuration(projectId: string, state: CurationState): void {
   writeAtomic(file(projectId, "curation.json"), JSON.stringify(state, null, 2));
+  notifyProject(projectId);
 }
 
 export type PendingSource = {

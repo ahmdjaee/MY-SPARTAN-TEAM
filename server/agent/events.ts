@@ -7,6 +7,33 @@ function preview(value: unknown, max = 600): string {
   return text.length > max ? `${text.slice(0, max)}…` : text;
 }
 
+/** Data `result` yang tidak ditampilkan tapi dibutuhkan runner: siapa pemilik turn ini dan total biaya sesinya. */
+export type ResultMeta = {
+  sessionId?: string;
+  /** Total berjalan sesi (kumulatif lintas turn dan resume), bukan biaya turn. */
+  totalUsd?: number;
+  /** uuid pesan kita yang dijawab turn ini; kosong untuk turn yang dimulai CLI sendiri dan result crash. */
+  userMessageUuids?: string[];
+  /** > 0 berarti masih ada pesan antre yang akan dijalankan CLI setelah ini. */
+  queuedTurns?: number;
+};
+
+export function resultMeta(message: SDKMessage): ResultMeta | undefined {
+  if (message.type !== "result") return undefined;
+  const result = message as unknown as Record<string, unknown>;
+  const list = Array.isArray(result.user_message_uuids)
+    ? result.user_message_uuids.filter((value): value is string => typeof value === "string")
+    : undefined;
+  const single = typeof result.user_message_uuid === "string" ? result.user_message_uuid : undefined;
+  return {
+    sessionId: typeof result.session_id === "string" ? result.session_id : undefined,
+    totalUsd:
+      typeof result.total_cost_usd === "number" && Number.isFinite(result.total_cost_usd) ? result.total_cost_usd : undefined,
+    userMessageUuids: list?.length ? list : single ? [single] : undefined,
+    queuedTurns: typeof result.queued_turn_count === "number" ? result.queued_turn_count : undefined,
+  };
+}
+
 /** Ubah satu SDKMessage menjadi nol atau beberapa event UI. */
 export function toUiEvents(message: SDKMessage): UiEvent[] {
   const events: UiEvent[] = [];
@@ -26,6 +53,12 @@ export function toUiEvents(message: SDKMessage): UiEvent[] {
 
   if (message.type === "system" && message.subtype === "permission_denied") {
     events.push({ type: "error", message: `Tool ${message.tool_name} ditolak: ${message.message}` });
+    return events;
+  }
+
+  if (message.type === "system" && message.subtype === "compact_boundary") {
+    const { trigger, pre_tokens: preTokens, post_tokens: postTokens } = message.compact_metadata;
+    events.push({ type: "compact", trigger, preTokens, postTokens });
     return events;
   }
 
