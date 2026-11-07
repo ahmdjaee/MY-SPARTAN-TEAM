@@ -1,6 +1,6 @@
 /**
  * Fase 1 — bukti bahwa Agent SDK memakai sesi login Claude di mesin ini,
- * tanpa ANTHROPIC_API_KEY. Jalankan: npm run check:auth
+ * tanpa ANTHROPIC_API_KEY. Jalankan: bun run check:auth
  */
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import { agentEnv } from "../server/config.ts";

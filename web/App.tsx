@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Outlet, useLocation, useMatch, useNavigate, useSearchParams } from "react-router-dom";
 import {
   api,
@@ -28,10 +28,6 @@ export function App() {
   const [projects, setProjects] = useState<ProjectInfo[]>([]);
   const [workspaceDir, setWorkspaceDir] = useState("");
   const [targetUrl, setTargetUrl] = useState("");
-  const [account, setAccount] = useState<{
-    email?: string;
-    subscriptionType?: string;
-  } | null>();
   const [settings, setSettings] = useState<SettingsData>();
   const settingsRef = useRef<SettingsData | undefined>(undefined);
   const [creating, setCreating] = useState(false);
@@ -61,19 +57,22 @@ export function App() {
   const filterProject = projectParam && projects.some((project) => project.id === projectParam) ? projectParam : "";
   const activeProject = projects.find((project) => project.id === filterProject);
 
-  const setFilter = (key: "project" | "role" | "status", value: string) => {
-    const next = new URLSearchParams(search);
-    if (value) next.set(key, value);
-    else next.delete(key);
-    // Pindah project: tugas yang sedang terbuka bisa milik project lain, jadi
-    // kembali ke halaman utama supaya tugas pertama project baru yang dibuka.
-    if (key === "project" && location.pathname.startsWith("/tasks/")) {
-      navigate(`/${next.toString() ? `?${next.toString()}` : ""}`, { replace: true });
-      return;
-    }
-    // Mengganti filter bukan perpindahan tempat, jadi jangan menumpuk riwayat.
-    setSearch(next, { replace: true });
-  };
+  const setFilter = useCallback(
+    (key: "project" | "role" | "status", value: string) => {
+      const next = new URLSearchParams(search);
+      if (value) next.set(key, value);
+      else next.delete(key);
+      // Pindah project: tugas yang sedang terbuka bisa milik project lain, jadi
+      // kembali ke halaman utama supaya tugas pertama project baru yang dibuka.
+      if (key === "project" && location.pathname.startsWith("/tasks/")) {
+        navigate(`/${next.toString() ? `?${next.toString()}` : ""}`, { replace: true });
+        return;
+      }
+      // Mengganti filter bukan perpindahan tempat, jadi jangan menumpuk riwayat.
+      setSearch(next, { replace: true });
+    },
+    [search, location.pathname, navigate, setSearch],
+  );
 
   // Tombol Memori/Pengaturan bisa diklik lagi untuk kembali ke tugas yang tadi dibuka.
   const lastTaskPath = useRef("/");
@@ -106,12 +105,29 @@ export function App() {
     }
   }, [collapsed]);
 
+  // Payload yang sama tidak boleh memicu render ulang seluruh aplikasi — daftar dibandingkan dulu.
+  const lastTasksJson = useRef("");
+  const lastSlotsJson = useRef("");
+  const lastProjectsJson = useRef("");
+  // Respons filter lama yang datang terlambat tidak boleh menimpa daftar filter baru.
+  const tasksRequest = useRef(0);
+
   const loadTasks = useCallback(() => {
+    const requestId = (tasksRequest.current += 1);
     void api
       .tasks({ role: filterRole, status: filterStatus, project: filterProject })
       .then((data) => {
-        setTasks(data.tasks);
-        setSlots(data.slots);
+        if (requestId !== tasksRequest.current) return;
+        const tasksJson = JSON.stringify(data.tasks);
+        if (tasksJson !== lastTasksJson.current) {
+          lastTasksJson.current = tasksJson;
+          setTasks(data.tasks);
+        }
+        const slotsJson = JSON.stringify(data.slots);
+        if (slotsJson !== lastSlotsJson.current) {
+          lastSlotsJson.current = slotsJson;
+          setSlots(data.slots);
+        }
         setTasksLoaded(true);
       })
       .catch(() => undefined);
@@ -120,7 +136,12 @@ export function App() {
   const loadProjects = useCallback(() => {
     void api
       .projects()
-      .then((data) => setProjects(data.projects))
+      .then((data) => {
+        const json = JSON.stringify(data.projects);
+        if (json === lastProjectsJson.current) return;
+        lastProjectsJson.current = json;
+        setProjects(data.projects);
+      })
       .catch(() => undefined);
   }, []);
 
@@ -128,12 +149,18 @@ export function App() {
   // utama tidak melompat ke tugas dari project sebelumnya.
   useEffect(() => {
     setTasksLoaded(false);
+    lastTasksJson.current = "";
   }, [filterRole, filterStatus, filterProject]);
 
+  // Pembaruan daftar datang dari event `tasks_changed` (WebSocket, di bawah) — termasuk saat
+  // sambungan pulih. Tab yang terlihat lagi tetap memuat ulang, kalau-kalau sambungannya sedang putus.
   useEffect(() => {
     loadTasks();
-    const timer = setInterval(loadTasks, 3_000);
-    return () => clearInterval(timer);
+    const onVisible = () => {
+      if (!document.hidden) loadTasks();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => document.removeEventListener("visibilitychange", onVisible);
   }, [loadTasks]);
 
   useEffect(() => {
@@ -146,10 +173,6 @@ export function App() {
       setWorkspaceDir(data.workspaceDir);
       setTargetUrl(data.targetUrl);
     });
-    void api
-      .auth()
-      .then((data) => setAccount(data.account))
-      .catch(() => setAccount(null));
     void api.settings().then((data) => {
       setSettings(data);
       settingsRef.current = data;
@@ -160,13 +183,22 @@ export function App() {
   // sedang membuka tugas lain atau halaman Pengaturan.
   const navigateRef = useRef(navigate);
   navigateRef.current = navigate;
+  const loadTasksRef = useRef(loadTasks);
+  loadTasksRef.current = loadTasks;
   useEffect(() => {
-    return startAttentionStream((event) => {
-      const prefs = settingsRef.current?.notifications;
-      if (!prefs) return;
-      maybeNotify(event, prefs, (taskId) => navigateRef.current(taskPath(taskId)));
-    });
-  }, []);
+    return startAttentionStream(
+      (event) => {
+        const prefs = settingsRef.current?.notifications;
+        if (!prefs) return;
+        maybeNotify(event, prefs, (taskId) => navigateRef.current(taskPath(taskId)));
+      },
+      () => {
+        // Angka di pemilih project (menunggu, biaya) ikut turunan dari tugas.
+        loadTasksRef.current();
+        loadProjects();
+      },
+    );
+  }, [loadProjects]);
 
   // Penanda jumlah tugas yang menunggu keputusan di judul tab.
   useEffect(() => {
@@ -179,18 +211,20 @@ export function App() {
     setRefreshKey((value) => value + 1);
   }, [loadTasks, loadProjects]);
 
-  const context: AppContext = {
-    tasks,
-    tasksLoaded,
-    roles,
-    projects,
-    refreshKey,
-    refresh,
-    onSettingsSaved: (next) => {
-      setSettings(next);
-      settingsRef.current = next;
-    },
-  };
+  const onSettingsSaved = useCallback((next: SettingsData) => {
+    setSettings(next);
+    settingsRef.current = next;
+  }, []);
+
+  // Objek yang stabil: konsumen useOutletContext hanya render ulang kalau isinya memang berubah.
+  const context = useMemo<AppContext>(
+    () => ({ tasks, tasksLoaded, roles, projects, refreshKey, refresh, onSettingsSaved }),
+    [tasks, tasksLoaded, roles, projects, refreshKey, refresh, onSettingsSaved],
+  );
+
+  const onSelectTask = useCallback((id: string) => navigate(taskPath(id, undefined, search)), [navigate, search]);
+  const onFilterRole = useCallback((value: string) => setFilter("role", value), [setFilter]);
+  const onFilterStatus = useCallback((value: string) => setFilter("status", value), [setFilter]);
 
   return (
     <div className="flex h-full">
@@ -230,13 +264,6 @@ export function App() {
             </button>
             <div className="min-w-0">
               <h1 className="text-sm font-semibold tracking-wide text-ink">AI TEAM</h1>
-              {/* <p className="truncate text-[11px] text-muted">
-              {account === undefined
-                ? "memeriksa sesi…"
-                : account
-                  ? `${account.email} · ${account.subscriptionType ?? "?"}`
-                  : "sesi Claude tidak terdeteksi"}
-            </p> */}
             </div>
             <button
               onClick={() => setCreating(true)}
@@ -264,9 +291,9 @@ export function App() {
                 selectedId={selected}
                 filterRole={filterRole}
                 filterStatus={filterStatus}
-                onSelect={(id) => navigate(taskPath(id, undefined, search))}
-                onFilterRole={(value) => setFilter("role", value)}
-                onFilterStatus={(value) => setFilter("status", value)}
+                onSelect={onSelectTask}
+                onFilterRole={onFilterRole}
+                onFilterStatus={onFilterStatus}
               />
             </div>
 

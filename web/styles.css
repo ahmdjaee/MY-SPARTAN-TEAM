@@ -187,3 +187,10 @@ body {
 .markdown img { @apply my-3 max-w-full cursor-zoom-in rounded-lg border border-line; }
 .markdown blockquote { @apply my-3 border-l-2 border-line-strong pl-3 italic text-muted; }
 .markdown hr { @apply my-5 border-line; }
+
+/* Thread panjang (ribuan baris, mis. T-015): baris di luar layar tidak di-layout/paint. `auto` mengingat
+   tinggi terakhir yang sudah dirender, jadi scroll dan "ikut turun" tetap stabil. */
+.thread-rows > * {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 48px;
+}

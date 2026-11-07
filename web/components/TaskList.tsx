@@ -1,6 +1,13 @@
-import { STATUS_LABEL, STATUS_STYLE, type ProjectInfo, type RoleId, type TaskListItem, type TaskStatus } from "../api.ts";
-
-const ROLE_SHORT: Record<RoleId, string> = { qa: "QA", engineer: "Engineer", devops: "DevOps" };
+import { memo, useEffect, useState } from "react";
+import {
+  ROLE_SHORT,
+  STATUS_LABEL,
+  STATUS_STYLE,
+  type ProjectInfo,
+  type RoleId,
+  type TaskListItem,
+  type TaskStatus,
+} from "../api.ts";
 
 function age(iso: string): string {
   const minutes = Math.max(0, Math.round((Date.now() - new Date(iso).getTime()) / 60_000));
@@ -10,7 +17,11 @@ function age(iso: string): string {
   return hours < 24 ? `${hours}j` : `${Math.round(hours / 24)}h`;
 }
 
-export function TaskList({
+/**
+ * Daftar hanya render ulang kalau props-nya berubah (App membandingkan payload dulu).
+ * Umur relatif ("3m") tetap bergerak lewat detak satu menit.
+ */
+export const TaskList = memo(function TaskList({
   tasks,
   projects,
   showProject,
@@ -32,7 +43,13 @@ export function TaskList({
   onFilterRole: (role: RoleId | "") => void;
   onFilterStatus: (status: TaskStatus | "") => void;
 }) {
-  const nameOf = (projectId: string): string | undefined => projects.find((item) => item.id === projectId)?.name;
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    const timer = setInterval(() => setTick((value) => value + 1), 60_000);
+    return () => clearInterval(timer);
+  }, []);
+  const names = new Map(projects.map((item) => [item.id, item.name]));
+  const nameOf = (projectId: string): string | undefined => names.get(projectId);
   return (
     <div className="flex h-full flex-col">
       <div className="flex gap-2 border-b border-line px-3 py-2">
@@ -45,6 +62,7 @@ export function TaskList({
           <option value="qa">QA</option>
           <option value="engineer">Engineer</option>
           <option value="devops">DevOps</option>
+          <option value="uiux">UI/UX</option>
         </select>
         <select
           value={filterStatus}
@@ -97,4 +115,4 @@ export function TaskList({
       </div>
     </div>
   );
-}
+});

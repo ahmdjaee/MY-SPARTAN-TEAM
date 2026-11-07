@@ -1,6 +1,6 @@
+import { OPEN_STATUSES, appendInbox, getFinding, readInbox, readRegister, readState, recordRetest, registerDigest, reportFixed, type FindingStatus } from "./findings.ts";
 import { readMemory } from "./memory.ts";
 import {
-  appendProjectMemory,
   defaultProjectId,
   getProject,
   readContext,
@@ -36,6 +36,8 @@ const STATUS_LABEL: Record<TaskStatus, string> = {
 
 /** Maksimal tugas sebelah yang diringkas ke konteks; sisanya diambil lewat tool `project_tasks`. */
 const SIBLING_MAX = 12;
+/** Catatan kotak masuk yang ikut konteks; sisanya menunggu dirapikan kurator. */
+const INBOX_MAX = 30;
 const SIBLING_CHARS = 160;
 
 export function projectOfTask(taskId: string): Project | undefined {
@@ -102,6 +104,29 @@ export function contextBlock(taskId: string): string {
 
     const memory = readProjectMemory(project.id).trim();
     if (memory) parts.push(`## Memori project (ditulis tim)\n${stripHeading(memory)}`);
+
+    // Catatan `remember` yang belum sempat dikurasi tetap terbaca, supaya tidak hilang di antara dua kurasi.
+    const inbox = readInbox(project.id).slice(-INBOX_MAX);
+    if (inbox.length > 0) {
+      parts.push(
+        ["## Catatan tim terbaru (belum dirapikan kurator)", ...inbox.map((item) => `- [${item.at.slice(0, 10)}] (${item.taskId}) ${item.note}`)].join("\n"),
+      );
+    }
+
+    const state = readState(project.id).trim();
+    if (state) parts.push(`## Status project (ditulis kurator)\n${stripHeading(state)}`);
+
+    const register = registerDigest(project.id);
+    if (register) {
+      parts.push(
+        [
+          "## Register temuan project",
+          register,
+          "",
+          "Ini sumber kebenaran temuan di project ini. Sebelum melaporkan temuan, cocokkan dengan daftar di atas: temuan yang sama dirujuk dengan id F-nnn-nya, yang sudah ditutup tidak dilaporkan ulang kecuali muncul lagi (tulis sebagai regresi). Detail satu temuan: tool `finding_detail`; daftar per status: `findings_list`.",
+        ].join("\n"),
+      );
+    }
   }
 
   const global = readMemory().trim();
@@ -185,13 +210,78 @@ export function siblingDetail(taskId: string, otherId: string): ToolAnswer {
   return { text: parts.join("\n") };
 }
 
-/** Tool `remember`: butir baru masuk ke memori project tugas itu. */
+/**
+ * Tool `remember`: catatan masuk kotak masuk project. Kurator yang menggabungkannya ke
+ * memory.md (membuang duplikat dan fakta basi); sampai saat itu ia tetap ikut konteks.
+ */
 export function rememberFor(taskId: string, note: string): { project?: string } {
   const task = getTask(taskId);
   const project = task ? getProject(task.projectId) : undefined;
   if (!project) return {};
-  appendProjectMemory(project.id, note, taskId);
+  appendInbox(project.id, taskId, note);
   return { project: project.name };
+}
+
+/** Tool `findings_list`: register temuan project tugas itu. */
+export function findingsListFor(taskId: string, status?: FindingStatus | "all"): ToolAnswer {
+  const project = projectOfTask(taskId);
+  if (!project) return { text: "ERROR: tugas ini belum punya project", isError: true };
+  const all = readRegister(project.id).findings;
+  const list = all.filter((finding) =>
+    status === "all" ? true : status ? finding.status === status : OPEN_STATUSES.includes(finding.status),
+  );
+  if (list.length === 0) return { text: `Tidak ada temuan${status ? ` berstatus ${status}` : " terbuka"} (${all.length} total di register).` };
+  const lines = list.map((finding) => {
+    const tasks = [...new Set(finding.occurrences.map((item) => item.taskId))].join(", ");
+    return `- ${finding.id} · ${finding.severity} · ${finding.status} · ${finding.title}${finding.area ? ` · ${finding.area}` : ""}${tasks ? ` · dilaporkan: ${tasks}` : ""}${finding.mergedInto ? ` · duplikat dari ${finding.mergedInto}` : ""}`;
+  });
+  return { text: `${list.length} temuan:\n${lines.join("\n")}\n\nDetail: finding_detail(id).` };
+}
+
+/** Tool `finding_detail`: satu temuan beserta jejaknya di laporan tugas. */
+export function findingDetailFor(taskId: string, id: string): ToolAnswer {
+  const project = projectOfTask(taskId);
+  if (!project) return { text: "ERROR: tugas ini belum punya project", isError: true };
+  const finding = getFinding(project.id, id);
+  if (!finding) return { text: `ERROR: ${id} tidak ada di register project ini`, isError: true };
+  const parts = [
+    `# ${finding.id} — ${finding.title}`,
+    `severity: ${finding.severity} · status: ${finding.status}${finding.area ? ` · area: ${finding.area}` : ""}${finding.mergedInto ? ` · duplikat dari ${finding.mergedInto}` : ""}`,
+  ];
+  if (finding.summary) parts.push("", finding.summary);
+  if (finding.resolution) parts.push("", `Penutupan (${finding.resolution.by}, ${finding.resolution.at.slice(0, 10)}): ${finding.resolution.note}`);
+  if (finding.occurrences.length > 0) {
+    parts.push("", "## Kemunculan");
+    for (const item of finding.occurrences) {
+      const report = existsSync(reportPath(item.taskId)) ? ` — laporan: ${reportPath(item.taskId)}` : "";
+      parts.push(`- ${item.taskId}${item.localId ? ` ${item.localId}` : ""} (${item.at.slice(0, 10)})${item.note ? `: ${item.note}` : ""}${report}`);
+    }
+  }
+  return { text: parts.join("\n") };
+}
+
+/** Tool `finding_report_fixed`: Engineer/DevOps melapor sudah memperbaiki satu temuan. */
+export function reportFixedFor(taskId: string, id: string, note: string, commit?: string): ToolAnswer {
+  const project = projectOfTask(taskId);
+  if (!project) return { text: "ERROR: tugas ini belum punya project", isError: true };
+  try {
+    const finding = reportFixed(project.id, id, { taskId, note, commit });
+    return { text: `${finding.id} sekarang menunggu uji ulang QA.` };
+  } catch (error) {
+    return { text: `ERROR: ${(error as Error).message}`, isError: true };
+  }
+}
+
+/** Tool `finding_retest`: QA mencatat hasil uji ulang satu temuan. */
+export function recordRetestFor(taskId: string, id: string, passed: boolean, note: string, evidence: string): ToolAnswer {
+  const project = projectOfTask(taskId);
+  if (!project) return { text: "ERROR: tugas ini belum punya project", isError: true };
+  try {
+    const finding = recordRetest(project.id, id, { taskId, passed, note, evidence });
+    return { text: `${finding.id} sekarang ${finding.status === "fixed" ? "terverifikasi diperbaiki" : "terbuka"}.` };
+  } catch (error) {
+    return { text: `ERROR: ${(error as Error).message}`, isError: true };
+  }
 }
 
 /** Potongan transcript yang dikirim ke panel Tanya: cukup untuk paham, tidak sampai membengkak. */

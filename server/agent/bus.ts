@@ -22,7 +22,7 @@ class TaskBus {
     };
   }
 
-  /** Penyimak lintas tugas: dipakai notifikasi browser lewat GET /api/events. */
+  /** Penyimak lintas tugas: dipakai notifikasi browser lewat topik `global` di WebSocket. */
   subscribeAll(listener: (event: AttentionEvent) => void): () => void {
     this.watchers.add(listener);
     return () => this.watchers.delete(listener);

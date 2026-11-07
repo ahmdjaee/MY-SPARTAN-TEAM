@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync,
 import { join } from "node:path";
 import { CONFIG } from "./config.ts";
 import { trimMemory } from "./memory.ts";
-import type { AutonomyMode, RoleId } from "./types.ts";
+import type { AutonomyMode, ContextUsage, RoleId } from "./types.ts";
 
 export type TaskStatus = "queued" | "running" | "waiting" | "needs_review" | "done" | "failed" | "cancelled";
 
@@ -17,6 +17,13 @@ export type Assignment = {
   handoffNote?: string;
   summary?: string;
   costUsd: number;
+  /**
+   * Total berjalan terakhir yang sudah dihitung untuk sesi ini. SDK melaporkan biaya sebagai total
+   * kumulatif per sesi (resume melanjutkan totalnya), jadi yang ditambahkan hanya selisihnya.
+   */
+  costMark?: { sessionId: string; totalUsd: number };
+  /** Pemakaian konteks terakhir yang diketahui, supaya indikatornya tetap ada setelah sesi ditutup. */
+  context?: ContextUsage & { at: string };
 };
 
 export type Review = {
@@ -84,12 +91,27 @@ export function writeNotes(id: string, text: string): string {
 }
 
 export function hasNotes(id: string): boolean {
-  return readNotes(id).trim().length > 0;
+  try {
+    return statSync(notesPath(id)).size > 0;
+  } catch {
+    return false;
+  }
 }
 
 // ---------- indeks dalam memori ----------
 
 const index = new Map<string, Task>();
+
+/** assetCount/hasReport untuk daftar — tugas yang sudah berhenti tidak berubah lagi, jadi cukup dihitung sekali. */
+const summaryCache = new Map<string, { assetCount: number; hasReport: boolean }>();
+
+const tasksListeners = new Set<(task: Task) => void>();
+
+/** Dipanggil setiap task.json ditulis — dipakai WebSocket untuk menyuruh klien memuat ulang daftar/detail. */
+export function onTasksChanged(listener: (task: Task) => void): () => void {
+  tasksListeners.add(listener);
+  return () => tasksListeners.delete(listener);
+}
 
 function metaPath(id: string): string {
   return join(taskDir(id), "task.json");
@@ -101,6 +123,14 @@ function persist(task: Task): void {
   writeFileSync(tmp, JSON.stringify(task, null, 2));
   renameSync(tmp, metaPath(task.id));
   index.set(task.id, task);
+  summaryCache.delete(task.id);
+  for (const listener of tasksListeners) {
+    try {
+      listener(task);
+    } catch {
+      // satu penyimak yang error tidak boleh menggagalkan penyimpanan
+    }
+  }
 }
 
 export function loadTasks(): void {
@@ -204,13 +234,57 @@ export function addAssignment(id: string, role: RoleId, handoffNote?: string): T
   return updateTask(id, { assignments, role, status: "queued", suggestedNext: undefined });
 }
 
-export function addCost(id: string, costUsd: number): void {
+/**
+ * Catat biaya dari `total_cost_usd` sebuah result. Nilainya total berjalan sesi, bukan biaya turn:
+ * yang ditambahkan ke tugas hanya selisih terhadap total terakhir sesi itu (`costMark`).
+ *
+ * - Biaya masuk ke penugasan pemilik sesi, bukan sekadar penugasan terakhir (result telat setelah oper).
+ * - Total 0 (result crash) dilewati tanpa menurunkan tanda; total yang turun berarti sesi di-reset (/clear).
+ * - `monotonicOnly`: dari Query yang sudah ditutup — hanya kenaikan pada sesi yang dikenal yang dicatat.
+ *
+ * Mengembalikan biaya turn ini (0 kalau tidak ada yang baru), atau undefined kalau tidak bisa dicatat.
+ */
+export function recordSessionCost(
+  id: string,
+  sessionId: string,
+  totalUsd: number,
+  options?: { monotonicOnly?: boolean },
+): number | undefined {
   const task = index.get(id);
-  if (!task || !costUsd) return;
+  if (!task || !sessionId || !Number.isFinite(totalUsd)) return undefined;
+  if (totalUsd <= 0) return 0;
   const assignments = [...task.assignments];
-  const last = assignments[assignments.length - 1];
-  if (last) assignments[assignments.length - 1] = { ...last, costUsd: last.costUsd + costUsd };
-  updateTask(id, { assignments, costUsd: Number((task.costUsd + costUsd).toFixed(6)) });
+  let at = assignments.findLastIndex((assignment) => assignment.sessionId === sessionId);
+  if (at < 0) {
+    if (options?.monotonicOnly) return undefined;
+    at = assignments.length - 1;
+  }
+  const target = assignments[at];
+  if (!target) return undefined;
+
+  const mark = target.costMark?.sessionId === sessionId ? target.costMark.totalUsd : undefined;
+  let delta: number;
+  if (mark === undefined) {
+    // Penugasan dari sebelum perbaikan ini sudah memuat biaya sesi ini (dijumlah cara lama):
+    // cukup pasang tandanya supaya tidak dihitung dua kali.
+    delta = !target.costMark && target.costUsd > 0 && target.sessionId === sessionId ? 0 : totalUsd;
+  } else if (totalUsd >= mark) {
+    delta = totalUsd - mark;
+  } else if (options?.monotonicOnly) {
+    return 0;
+  } else {
+    delta = totalUsd;
+  }
+  delta = Number(delta.toFixed(6));
+  if (delta === 0 && mark === totalUsd) return 0;
+
+  assignments[at] = {
+    ...target,
+    costUsd: Number((target.costUsd + delta).toFixed(6)),
+    costMark: { sessionId, totalUsd },
+  };
+  updateTask(id, { assignments, costUsd: Number((task.costUsd + delta).toFixed(6)) });
+  return delta;
 }
 
 /** Biaya panel Tanya tidak ikut menambah biaya tugas — angka di daftar tetap berarti "biaya bot". */
@@ -221,6 +295,10 @@ export function addAskCost(id: string, costUsd: number): void {
 }
 
 const IMAGE_RE = /\.(png|jpe?g|webp|gif)$/i;
+
+export function isImageName(name: string): boolean {
+  return IMAGE_RE.test(name);
+}
 
 export function listAssets(id: string): string[] {
   const dir = assetsDir(id);
@@ -303,6 +381,18 @@ const RANK: Record<TaskStatus, number> = {
   cancelled: 6,
 };
 
+/** Agen masih menulis ke folder tugas aktif di luar persist(), jadi hanya tugas berhenti yang di-cache. */
+function summaryExtras(task: Task): { assetCount: number; hasReport: boolean } {
+  const active = ACTIVE_STATUSES.includes(task.status);
+  if (!active) {
+    const cached = summaryCache.get(task.id);
+    if (cached) return cached;
+  }
+  const extras = { assetCount: listAssets(task.id).length, hasReport: existsSync(reportPath(task.id)) };
+  if (!active) summaryCache.set(task.id, extras);
+  return extras;
+}
+
 export function listTasks(filter?: { role?: RoleId; status?: TaskStatus; project?: string }): TaskSummary[] {
   return [...index.values()]
     .filter(
@@ -311,11 +401,10 @@ export function listTasks(filter?: { role?: RoleId; status?: TaskStatus; project
         (!filter?.status || task.status === filter.status) &&
         (!filter?.project || task.projectId === filter.project),
     )
-    .map(({ description: _description, ...rest }) => ({
-      ...rest,
-      assetCount: listAssets(rest.id).length,
-      hasReport: existsSync(reportPath(rest.id)),
-    }))
+    .map((task) => {
+      const { description: _description, ...rest } = task;
+      return { ...rest, ...summaryExtras(task) };
+    })
     .sort((a, b) => RANK[a.status] - RANK[b.status] || b.updatedAt.localeCompare(a.updatedAt));
 }
 
@@ -339,8 +428,15 @@ export function activeTasks(): Task[] {
  * Ambil bagian "Ringkasan serah terima" dari teks penutup agen.
  * Kalau tidak ada, pakai beberapa baris terakhir sebagai gantinya.
  */
+const HANDOFF_SUMMARY = /##+\s*Ringkasan serah terima\s*\n([\s\S]*)$/i;
+
+/** Teks ini memuat bagian "## Ringkasan serah terima"? */
+export function hasHandoffSummary(text: string): boolean {
+  return HANDOFF_SUMMARY.test(text);
+}
+
 export function extractHandoffSummary(text: string): string {
-  const match = text.match(/##+\s*Ringkasan serah terima\s*\n([\s\S]*)$/i);
+  const match = text.match(HANDOFF_SUMMARY);
   const body = (match?.[1] ?? text).trim();
   return body.length > 4000 ? `${body.slice(0, 4000)}…` : body;
 }

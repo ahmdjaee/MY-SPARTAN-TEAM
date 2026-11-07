@@ -1,6 +1,6 @@
 /** Pastikan MCP browser in-process terhubung dan tool-nya terdaftar untuk QA. */
 import { query } from "@anthropic-ai/claude-agent-sdk";
-import { createBrowserServer } from "../server/browser/mcp.ts";
+import { BrowserSession, createBrowserServer } from "../server/browser/mcp.ts";
 import { agentEnv } from "../server/config.ts";
 import { ROLES } from "../server/roles.ts";
 
@@ -11,7 +11,7 @@ const q = query({
     maxTurns: 1,
     settingSources: [],
     persistSession: false,
-    mcpServers: { browser: createBrowserServer(() => undefined) },
+    mcpServers: { browser: createBrowserServer(new BrowserSession(() => undefined), () => undefined) },
     settings: { permissions: ROLES.qa.permissions },
     env: agentEnv(),
   },

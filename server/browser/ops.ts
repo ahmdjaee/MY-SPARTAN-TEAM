@@ -1,6 +1,6 @@
 /**
  * Operasi halaman yang butuh diperiksa di dalam DOM: scroll, inspeksi overflow, baca teks.
- * Dipisah dari `mcp.ts` supaya bisa diuji tanpa menjalankan agen (`npm run check:browser`).
+ * Dipisah dari `mcp.ts` supaya bisa diuji tanpa menjalankan agen (`bun run check:browser`).
  */
 import type { Page } from "playwright";
 
@@ -29,6 +29,21 @@ export type ScrollReport = {
   maxTop: number;
 };
 
+/** Gaya yang menentukan keterbacaan, untuk audit UI/UX. */
+export type VisualReport = {
+  color: string;
+  background?: string;
+  fontSize: string;
+  fontWeight: string;
+  lineHeight: string;
+  /** Rasio kontras WCAG, dibulatkan ke bawah supaya 4,496 tidak terbaca lolos 4,5. */
+  contrast?: number;
+  /** Batas AA untuk ukuran teks ini: 3 untuk teks besar, 4,5 untuk teks biasa. */
+  contrastTarget: number;
+  /** Kenapa kontras tidak dihitung. */
+  contrastNote?: string;
+};
+
 export type ElementReport = {
   name: string;
   box: { x: number; y: number; width: number; height: number };
@@ -50,6 +65,7 @@ export type ElementReport = {
   /** Scroller terdekat ke atas, kalau elemen ini bukan scroller-nya sendiri. */
   scroller?: ScrollerInfo;
   text: string;
+  visual: VisualReport;
 };
 
 type ProbeArgs = {
@@ -163,6 +179,82 @@ function probe(args: ProbeArgs): ProbeResult {
     };
   }
 
+  type Rgba = { r: number; g: number; b: number; a: number };
+
+  /** Computed style bisa berupa `oklch()` atau `color()`, jadi warnanya dibaca lewat canvas, bukan di-parse. */
+  const paint = document.createElement("canvas").getContext("2d", { willReadFrequently: true });
+  const rgbaOf = (css: string): Rgba | undefined => {
+    if (!paint) return undefined;
+    paint.clearRect(0, 0, 1, 1);
+    paint.fillStyle = css;
+    paint.fillRect(0, 0, 1, 1);
+    const [r, g, b, a] = paint.getImageData(0, 0, 1, 1).data;
+    return { r: r!, g: g!, b: b!, a: a! / 255 };
+  };
+
+  const over = (top: Rgba, under: Rgba): Rgba => ({
+    r: top.r * top.a + under.r * (1 - top.a),
+    g: top.g * top.a + under.g * (1 - top.a),
+    b: top.b * top.a + under.b * (1 - top.a),
+    a: 1,
+  });
+
+  const hex = (color: Rgba): string =>
+    `#${[color.r, color.g, color.b].map((part) => Math.round(part).toString(16).padStart(2, "0")).join("")}`;
+
+  const luminance = (color: Rgba): number => {
+    const [r, g, b] = [color.r, color.g, color.b].map((part) => {
+      const value = part / 255;
+      return value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4;
+    });
+    return 0.2126 * r! + 0.7152 * g! + 0.0722 * b!;
+  };
+
+  /** Warna di belakang teks. `reason` berarti warnanya tidak bisa dipastikan, jadi jangan dihitung. */
+  const backdropOf = (el: Element): { color?: Rgba; reason?: string } => {
+    const layers: Rgba[] = [];
+    let settled = false;
+    for (let node: Element | null = el; node; node = node.parentElement) {
+      const style = getComputedStyle(node);
+      if (Number(style.opacity) < 1) return { reason: `${name(node)} memakai opacity ${style.opacity}` };
+      if (settled) continue;
+      if (style.backgroundImage !== "none") return { reason: `background ${name(node)} memakai gambar atau gradient` };
+      const color = rgbaOf(style.backgroundColor);
+      if (!color) return { reason: "warna tidak bisa dibaca di halaman ini" };
+      if (color.a === 0) continue;
+      layers.push(color);
+      if (color.a === 1) settled = true;
+    }
+    // Tanpa background sama sekali, kanvas bawaan browser berwarna putih.
+    const base: Rgba = { r: 255, g: 255, b: 255, a: 1 };
+    return { color: layers.reduceRight((under, top) => over(top, under), base) };
+  };
+
+  /** Teks anak punya warnanya sendiri: angka kontras hanya berarti untuk elemen yang memuat teksnya langsung. */
+  const hasOwnText = (el: Element): boolean =>
+    /^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName) ||
+    Array.from(el.childNodes).some((node) => node.nodeType === Node.TEXT_NODE && (node.textContent ?? "").trim() !== "");
+
+  const visualOf = (el: Element): VisualReport => {
+    const style = getComputedStyle(el);
+    const size = Number.parseFloat(style.fontSize);
+    const large = size >= 24 || (size >= 18.66 && Number(style.fontWeight) >= 700);
+    const color = rgbaOf(style.color);
+    const backdrop = backdropOf(el);
+    const report: VisualReport = {
+      color: color ? hex(backdrop.color ? over(color, backdrop.color) : color) : style.color,
+      background: backdrop.color ? hex(backdrop.color) : undefined,
+      fontSize: style.fontSize,
+      fontWeight: style.fontWeight,
+      lineHeight: style.lineHeight,
+      contrastTarget: large ? 3 : 4.5,
+    };
+    if (!hasOwnText(el)) return { ...report, contrastNote: "elemen ini tidak memuat teks langsung; inspect elemen teksnya" };
+    if (!color || !backdrop.color) return { ...report, contrastNote: backdrop.reason ?? "warna tidak bisa dibaca di halaman ini" };
+    const [lighter, darker] = [luminance(over(color, backdrop.color)), luminance(backdrop.color)].sort((a, b) => b - a);
+    return { ...report, contrast: Math.floor(((lighter! + 0.05) / (darker! + 0.05)) * 100) / 100 };
+  };
+
   const limit = args.limit ?? 3;
   const reports = all.slice(0, limit).map((el): ElementReport => {
     const style = getComputedStyle(el);
@@ -191,6 +283,7 @@ function probe(args: ProbeArgs): ProbeResult {
       clippedByEllipsis: style.textOverflow === "ellipsis" && overflows(el, "x"),
       scroller: scroller === el ? undefined : describeScroller(scroller),
       text: textOf(el),
+      visual: visualOf(el),
     };
   });
 
@@ -348,11 +441,22 @@ export function formatInspect(reports: ElementReport[], selector: string): strin
         );
       }
       for (const line of verdictLines(report)) lines.push(`  ${line}`);
+      const { visual } = report;
+      lines.push(
+        `  warna ${visual.color} di atas ${visual.background ?? "(background tidak pasti)"} · font ${visual.fontSize}/${visual.lineHeight} weight ${visual.fontWeight}`,
+        `  ${contrastLine(visual)}`,
+      );
       lines.push(`  Teks: ${report.text || "(kosong)"}`);
       return lines.join("\n");
     })
     .join("\n\n")
     .concat(`\n\n(selector: ${selector} — ${reports.length} elemen dilaporkan)`);
+}
+
+function contrastLine(visual: VisualReport): string {
+  if (visual.contrast === undefined) return `kontras tidak bisa dihitung: ${visual.contrastNote ?? "alasan tidak diketahui"}`;
+  const verdict = visual.contrast >= visual.contrastTarget ? "lolos" : "GAGAL";
+  return `kontras ${visual.contrast}:1 — ${verdict} AA (batas ${visual.contrastTarget}:1 untuk ukuran ini)`;
 }
 
 /** Teks hasil `scroll` untuk dikirim ke agen. */

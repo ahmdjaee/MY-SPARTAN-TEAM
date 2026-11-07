@@ -16,7 +16,12 @@ export type PolicyDecision = {
   category?: PolicyCategory;
 };
 
-export type PolicyContext = { workspaceDir: string; taskDir?: string };
+export type PolicyContext = {
+  workspaceDir: string;
+  taskDir?: string;
+  /** `false` menolak `git commit` karena pemilik belum memintanya; `undefined` melewati gerbang ini. */
+  commitRequested?: boolean;
+};
 
 type Rule = { test: RegExp; reason: string; category?: PolicyCategory };
 
@@ -118,12 +123,92 @@ function removesOutsideWorkArea(command: string, ctx: PolicyContext): boolean {
   return false;
 }
 
+/** Harus di posisi perintah: menyebut "git commit" di dalam teks laporan tidak dihitung. */
+const GIT_COMMIT =
+  /(?:^|[;&|(\n]\s*|\bssh\s+\S+\s+['"])\s*(?:\w+=\S+\s+)*git(?:\s+(?:-[Cc]\s+\S+|--[\w-]+(?:=\S+)?))*\s+commit\b/;
+
+const AI_ATTRIBUTION = /co-authored-by[:=][^\n]*(?:claude|anthropic)|noreply@anthropic\.com|generated (?:with|by) \[?claude/i;
+
+const CONVENTIONAL_COMMIT = /^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([^)]+\))?!?: \S/;
+
+const MESSAGE_FLAG = String.raw`(?:^|\s)(?:-\w*m\s*|--message[=\s]\s*)`;
+const HEREDOC_MESSAGE = new RegExp(`${MESSAGE_FLAG}"?\\$\\(cat\\s+<<-?\\s*['"]?\\w+['"]?\\s*\\n\\s*([^\\n]*)`);
+const HEREDOC_STDIN = /(?:^|\s)(?:-\w*F\s*-|--file[=\s]\s*-)(?=\s)[^\n]*<<-?\s*['"]?\w+['"]?\s*\n\s*([^\n]*)/;
+const PLAIN_MESSAGE = new RegExp(`${MESSAGE_FLAG}(?:"((?:[^"\\\\]|\\\\.)*)"|'([^']*)'|(\\S+))`);
+
+/** Baris pertama pesan commit; `undefined` kalau perintahnya tidak membawa pesan baru (mis. `--amend --no-edit`). */
+function commitSubject(args: string): string | undefined {
+  const heredoc = HEREDOC_MESSAGE.exec(args) ?? HEREDOC_STDIN.exec(args);
+  if (heredoc) return heredoc[1];
+  const plain = PLAIN_MESSAGE.exec(args);
+  if (!plain) return undefined;
+  return (plain[1] ?? plain[2] ?? plain[3] ?? "").split("\n")[0];
+}
+
+/** Argumen commit tanpa isi heredoc, isi kutipan, dan perintah sesudahnya, supaya teks pesan tidak terbaca sebagai flag. */
+function commitFlags(args: string): string {
+  return args
+    .replace(/<<-?\s*['"]?(\w+)['"]?[\s\S]*?\n\s*\1\b/g, "")
+    .replace(/"(?:[^"\\]|\\.)*"|'[^']*'/g, "")
+    .split(/[;&|\n]/)[0] ?? "";
+}
+
+const MESSAGE_FROM_FILE = /(?:^|\s)(?:-\w*F\s*(?!-(?:\s|$))\S|--file[=\s]\s*(?!-(?:\s|$))\S|-\w*t\s*\S|--template\b)/;
+
+/** Aturan khusus `git commit`; `undefined` kalau perintahnya bukan commit atau commit-nya lolos. */
+function checkCommit(command: string, ctx: PolicyContext): PolicyDecision | undefined {
+  const match = GIT_COMMIT.exec(command);
+  if (!match) return undefined;
+  const deny = (reason: string): PolicyDecision => ({ decision: "deny", reason });
+
+  if (ctx.commitRequested === false) {
+    return deny("pemilik produk belum meminta commit. Tinggalkan perubahan di working tree, atau tanyakan dulu");
+  }
+  if (AI_ATTRIBUTION.test(command)) return deny("pesan commit tidak boleh memuat label atribusi AI");
+
+  const args = command.slice(match.index + match[0].length);
+  if (MESSAGE_FROM_FILE.test(commitFlags(args))) {
+    return deny("pesan commit dari berkas tidak bisa diperiksa. Pakai -m");
+  }
+  const subject = commitSubject(args);
+  if (subject !== undefined && !CONVENTIONAL_COMMIT.test(subject)) {
+    return deny(
+      "pesan commit harus berformat Conventional Commits: <type>(<scope opsional>): <description>, dengan type feat, fix, docs, style, refactor, perf, test, build, ci, chore, atau revert",
+    );
+  }
+  return undefined;
+}
+
+const MENTIONS_COMMIT = /\b(?:di-?)?commit/i;
+const NEGATED_COMMIT = /\b(?:jangan|tidak|tak|belum|tanpa|gak|nggak|ngga|ga|no|not|don'?t)\s+(?:usah\s+|perlu\s+)?(?:di-?)?commit/i;
+
+/**
+ * Apakah pemilik meminta commit, dari pesan-pesannya (urut lama ke baru).
+ * Pesan terbaru yang menyebut commit yang menentukan. Ini pencocokan kata, bukan pemahaman
+ * kalimat: persona Engineer tetap menjadi penjaga untuk kalimat seperti "cek commit terakhir".
+ */
+export function commitRequestedIn(messages: string[]): boolean {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const decision = commitDecision(messages[index] ?? "");
+    if (decision !== undefined) return decision;
+  }
+  return false;
+}
+
+/** Keputusan satu pesan: true = minta commit, false = melarang, undefined = tidak menyebut commit. */
+export function commitDecision(message: string): boolean | undefined {
+  if (!MENTIONS_COMMIT.test(message)) return undefined;
+  return !NEGATED_COMMIT.test(message);
+}
+
 export function classifyCommand(command: string, ctx: PolicyContext): PolicyDecision {
   const text = command.replace(/\s+/g, " ");
 
   for (const rule of DENY) {
     if (rule.test.test(text)) return { decision: "deny", reason: rule.reason };
   }
+  const commitVerdict = checkCommit(command, ctx);
+  if (commitVerdict) return commitVerdict;
   for (const rule of ASK) {
     if (rule.test.test(text)) return { decision: "ask", reason: rule.reason, category: rule.category };
   }

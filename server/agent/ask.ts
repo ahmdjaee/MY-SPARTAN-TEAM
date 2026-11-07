@@ -29,11 +29,17 @@ export type AskEvent =
 
 const READ_TOOLS = ["Read", "Grep", "Glob"];
 
+/** Model yang boleh dipakai panel Tanya: QA (murah) untuk tanya biasa, Engineer untuk analisis berat. */
+export const ASK_MODELS = [
+  { id: CONFIG.models.qa, label: "Cepat & murah" },
+  { id: CONFIG.models.engineer, label: "Analisis berat" },
+];
+
 /** Panel ini hanya membaca; apa pun yang bisa mengubah sesuatu ditolak diam-diam. */
 export function askOptions(taskId: string, model: string, history: AskMessage[]): Options {
-  const denyTool: CanUseTool = async (toolName) =>
+  const denyTool: CanUseTool = async (toolName, input) =>
     READ_TOOLS.includes(toolName)
-      ? { behavior: "allow", updatedInput: {} }
+      ? { behavior: "allow", updatedInput: input }
       : { behavior: "deny", message: `Panel Tanya hanya boleh membaca (${READ_TOOLS.join(", ")}).` };
 
   return {
@@ -80,7 +86,7 @@ type Listener = (event: AskEvent) => void;
  */
 type Answer = { text: string; costUsd?: number };
 
-class AskSession {
+export class AskSession {
   private q?: Query;
   private pending?: string;
   private wake?: () => void;
@@ -101,9 +107,12 @@ class AskSession {
     while (!this.closed && generation === this.generation) {
       if (this.pending === undefined) {
         await new Promise<void>((resolve) => {
-          this.wake = resolve;
+          const wake = () => {
+            if (this.wake === wake) this.wake = undefined;
+            resolve();
+          };
+          this.wake = wake;
         });
-        this.wake = undefined;
         continue;
       }
       const text = this.pending;
@@ -126,8 +135,13 @@ class AskSession {
 
   private async consume(instance: Query): Promise<void> {
     let answer = "";
+    // `total_cost_usd` kumulatif per sesi; persistSession:false → tiap instance mulai dari 0.
+    let mark = 0;
+    let failure: Error | undefined;
     try {
       for await (const message of instance) {
+        // Sesi yang sudah ditutup: delta dan jawabannya bukan milik pertanyaan yang sekarang.
+        if (this.q !== instance) continue;
         if (message.type === "stream_event") {
           const event = message.event as { type: string; delta?: { type?: string; text?: string } };
           if (event.type === "content_block_delta" && event.delta?.type === "text_delta" && event.delta.text) {
@@ -146,21 +160,26 @@ class AskSession {
         }
         if (message.type === "result") {
           const result = message as unknown as Record<string, unknown>;
-          const costUsd = typeof result.total_cost_usd === "number" ? result.total_cost_usd : undefined;
-          if (costUsd) addAskCost(this.taskId, costUsd);
+          const total = typeof result.total_cost_usd === "number" ? result.total_cost_usd : undefined;
+          let costUsd: number | undefined;
+          if (total !== undefined && total > 0) {
+            costUsd = Number((total >= mark ? total - mark : total).toFixed(6));
+            mark = total;
+            if (costUsd > 0) addAskCost(this.taskId, costUsd);
+          }
           this.inflight?.resolve({ text: answer, costUsd });
           this.inflight = undefined;
           answer = "";
         }
       }
     } catch (error) {
-      this.inflight?.reject(error instanceof Error ? error : new Error(String(error)));
-      this.inflight = undefined;
-    } finally {
-      if (this.q === instance) this.q = undefined;
-      this.inflight?.reject(new Error("sesi tanya berakhir sebelum jawaban selesai"));
-      this.inflight = undefined;
+      failure = error instanceof Error ? error : new Error(String(error));
     }
+    // Instance lama (sudah diganti setelah idle/stop) tidak boleh menggagalkan pertanyaan sesi baru.
+    if (this.q !== instance) return;
+    this.q = undefined;
+    this.inflight?.reject(failure ?? new Error("sesi tanya berakhir sebelum jawaban selesai"));
+    this.inflight = undefined;
   }
 
   /** Satu pertanyaan → satu jawaban. Pemanggil menjaga agar tidak ada dua sekaligus. */
@@ -172,11 +191,26 @@ class AskSession {
       this.model = model;
     }
 
-    const answer = await new Promise<Answer>((resolve, reject) => {
-      this.inflight = { resolve, reject, text };
-      this.pending = text;
-      this.wake?.();
-    });
+    // CLI yang macet tidak boleh mengunci panel ini selamanya (state.busy).
+    const timer = setTimeout(() => {
+      const inflight = this.inflight;
+      this.inflight = undefined;
+      inflight?.reject(
+        new Error(`Jawaban melewati ${Math.round(CONFIG.askTimeoutMs / 60_000)} menit — sesi tanya dihentikan.`),
+      );
+      this.stop();
+    }, CONFIG.askTimeoutMs);
+    timer.unref();
+    let answer: Answer;
+    try {
+      answer = await new Promise<Answer>((resolve, reject) => {
+        this.inflight = { resolve, reject, text };
+        this.pending = text;
+        this.wake?.();
+      });
+    } finally {
+      clearTimeout(timer);
+    }
 
     this.startIdle();
     return {
@@ -204,12 +238,17 @@ class AskSession {
     this.clearIdle();
     this.generation += 1;
     this.wake?.();
+    const instance = this.q;
+    this.q = undefined;
     try {
-      this.q?.close();
+      instance?.close();
     } catch {
       // proses mungkin sudah mati
     }
-    this.q = undefined;
+    // Sesi yang ditutup tidak akan menjawab lagi; pertanyaan yang berjalan jangan dibiarkan menggantung.
+    const inflight = this.inflight;
+    this.inflight = undefined;
+    inflight?.reject(new Error("sesi tanya ditutup"));
   }
 
   close(): void {

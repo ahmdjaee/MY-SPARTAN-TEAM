@@ -3,8 +3,11 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import express from "express";
 import { askHub } from "./agent/ask.ts";
+import { curator } from "./agent/curator.ts";
 import { scheduler } from "./agent/scheduler.ts";
 import { CONFIG, ensureDirs } from "./config.ts";
+import { httpGuard } from "./http-guard.ts";
+import { attachRealtime } from "./realtime.ts";
 import { closeOrphanRequests } from "./recover.ts";
 import { approvalsRouter } from "./routes/approvals.ts";
 import { askRouter } from "./routes/ask.ts";
@@ -28,10 +31,13 @@ loadTasks();
 ensureDefaultProject();
 const adopted = adoptOrphanTasks();
 const orphans = closeOrphanRequests();
+curator.watch();
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const app = express();
 
+// Pagar Host/Origin dulu: permintaan dari situs lain tidak boleh sampai membaca body sekalipun.
+app.use("/api", httpGuard);
 app.use(express.json({ limit: "20mb" }));
 app.use("/api", tasksRouter, askRouter, projectsRouter, approvalsRouter, memoryRouter, settingsRouter, workspaceRouter, healthRouter);
 
@@ -54,7 +60,7 @@ if (existsSync(dist)) {
     res
       .status(200)
       .type("html")
-      .send("<h1>AI Team API aktif</h1><p>UI dev: jalankan <code>npm run dev</code> lalu buka port Vite.</p>");
+      .send("<h1>AI Team API aktif</h1><p>UI dev: jalankan <code>bun run dev</code> lalu buka port Vite.</p>");
   });
 }
 
@@ -66,14 +72,18 @@ const server = app.listen(CONFIG.port, CONFIG.host, () => {
   console.log(`  project   : ${listProjects().map((project) => project.id).join(", ")}`);
   console.log(`  workspace : ${CONFIG.workspaceDir} (bawaan; project boleh punya sendiri)`);
   console.log(`  data      : ${CONFIG.dataDir}`);
-  console.log(`  model     : qa=${CONFIG.models.qa} engineer=${CONFIG.models.engineer} devops=${CONFIG.models.devops}`);
+  console.log(`  model     : qa=${CONFIG.models.qa} engineer=${CONFIG.models.engineer} devops=${CONFIG.models.devops} uiux=${CONFIG.models.uiux}`);
   const resumed = scheduler.resumePending();
   if (resumed > 0) console.log(`  ${resumed} tugas yang sempat berjalan dilanjutkan`);
+  curator.catchUp();
 });
+const realtime = attachRealtime(server);
 
 async function shutdown(signal: string): Promise<void> {
   console.log(`\n${signal} — menutup sesi agen…`);
+  realtime.close();
   askHub.closeAll();
+  curator.closeAll();
   await scheduler.closeAll();
   server.close(() => process.exit(0));
   setTimeout(() => process.exit(0), 3_000).unref();

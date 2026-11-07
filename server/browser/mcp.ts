@@ -6,6 +6,7 @@ import { z } from "zod";
 import { CONFIG } from "../config.ts";
 import { assetsDir } from "../tasks.ts";
 import { live } from "./live.ts";
+import { KINDS, kindFromName, makeTestFile, type TestFileKind } from "./files.ts";
 import { DialogWatcher, formatInspect, formatScroll, inspect, readText, scroll } from "./ops.ts";
 
 type CallResult = Awaited<ReturnType<Parameters<typeof tool>[3]>>;
@@ -13,8 +14,40 @@ type CallResult = Awaited<ReturnType<Parameters<typeof tool>[3]>>;
 const ok = (text: string): CallResult => ({ content: [{ type: "text", text }] });
 const fail = (text: string): CallResult => ({ content: [{ type: "text", text: `ERROR: ${text}` }], isError: true });
 
+function viewportLabel(page: Page): string {
+  const size = page.viewportSize();
+  return size ? `${size.width}×${size.height}` : "(tidak diketahui)";
+}
+
 /** Sesi browser yang sedang hidup, supaya bisa ditutup dari luar saat tugas berakhir. */
 const sessions = new Map<string, BrowserSession>();
+
+/**
+ * Screencast tab Live: setiap gambar Chromium headless (60 per detik), hanya saat halaman berubah.
+ * `everyNthFrame` > 1 tidak dipakai: perubahan terakhir sebuah animasi bisa jatuh di gambar yang
+ * dilewati, lalu halaman diam dan tab Live membeku di keadaan lama (terukur: 10 dari 20 kali pada
+ * nilai 2). Penghematannya pun kecil, karena biaya utama screencast adalah biaya tetap selama menyala.
+ */
+const SCREENCAST = {
+  format: "jpeg",
+  quality: 55,
+  maxWidth: 1280,
+  maxHeight: 800,
+  everyNthFrame: 1,
+} as const;
+/** Batas tunggu screenshot penutup saat sesi browser ditutup tanpa penonton. */
+const FINAL_FRAME_TIMEOUT_MS = 2_000;
+/** Halaman yang memuntahkan error terus-menerus tidak boleh menumbuhkan memori tanpa batas. */
+const MAX_LOGS = 500;
+
+/** `undefined` kalau `promise` tidak selesai dalam `ms`. */
+function within<T>(promise: Promise<T>, ms: number): Promise<T | undefined> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<undefined>((resolve) => {
+    timer = setTimeout(() => resolve(undefined), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
 
 /** Tutup browser milik satu tugas (dipanggil runner saat tugas ditutup/dioper/dibatalkan). */
 export async function closeBrowserFor(taskId: string): Promise<void> {
@@ -24,12 +57,17 @@ export async function closeBrowserFor(taskId: string): Promise<void> {
 }
 
 /** Satu sesi browser per tugas, dipakai ulang antar tool call. */
-class BrowserSession {
+export class BrowserSession {
   private browser?: Browser;
   private page?: Page;
   private cdp?: CDPSession;
+  /** Screencast sedang menyala — ada yang menonton tab Live. */
+  private casting = false;
+  private offDemand?: () => void;
   private taskId?: string;
   private logs: string[] = [];
+  /** Log lama yang dibuang karena melewati MAX_LOGS sejak drain terakhir. */
+  private droppedLogs = 0;
   readonly dialogs = new DialogWatcher();
 
   constructor(private readonly getTaskId: () => string | undefined) {}
@@ -46,25 +84,30 @@ class BrowserSession {
       const page = await context.newPage();
       page.on("console", (message) => {
         if (message.type() === "error" || message.type() === "warning") {
-          this.logs.push(`[console.${message.type()}] ${message.text()}`);
+          this.log(`[console.${message.type()}] ${message.text()}`);
         }
       });
-      page.on("pageerror", (error) => this.logs.push(`[pageerror] ${error.message}`));
+      page.on("pageerror", (error) => this.log(`[pageerror] ${error.message}`));
       page.on("requestfailed", (request) =>
-        this.logs.push(`[requestfailed] ${request.method()} ${request.url()} — ${request.failure()?.errorText ?? "?"}`),
+        this.log(`[requestfailed] ${request.method()} ${request.url()} — ${request.failure()?.errorText ?? "?"}`),
       );
       page.on("response", (response) => {
-        if (response.status() >= 400) this.logs.push(`[http ${response.status()}] ${response.url()}`);
+        if (response.status() >= 400) this.log(`[http ${response.status()}] ${response.url()}`);
       });
       this.dialogs.attach(page);
       this.page = page;
       await this.startLive(page);
+    } else if (viewport) {
+      // Tanpa ini `open` kedua dengan ukuran lain diam-diam tetap memakai ukuran lama.
+      await this.page.setViewportSize(viewport);
     }
     return this.page;
   }
 
   /**
-   * Alirkan isi halaman ke panel Live lewat CDP screencast.
+   * Alirkan isi halaman ke panel Live lewat CDP screencast — hanya selama ada yang menonton.
+   * Screencast yang menyala memakan ±1 core Chromium selama halaman bergerak, walau tidak ada yang
+   * melihat hasilnya; saat penonton datang, frame keadaan sekarang tiba ±25 ms setelah dinyalakan.
    * Kegagalan di sini tidak boleh menjatuhkan pengujian — fitur menonton itu tambahan.
    */
   private async startLive(page: Page): Promise<void> {
@@ -72,29 +115,61 @@ class BrowserSession {
     if (!taskId) return;
     this.taskId = taskId;
     sessions.set(taskId, this);
+    this.offDemand?.();
+    this.offDemand = undefined;
+    this.casting = false;
 
     try {
       const client = await page.context().newCDPSession(page);
       this.cdp = client;
       client.on("Page.screencastFrame", (frame: { data: string; sessionId: number }) => {
-        live.publishFrame(taskId, Buffer.from(frame.data, "base64"));
+        // ACK langsung = izin untuk frame berikutnya. Menundanya membuat Chromium melewatkan frame
+        // terakhir sebuah animasi, sehingga tab Live membeku di keadaan setengah jalan.
         void client.send("Page.screencastFrameAck", { sessionId: frame.sessionId }).catch(() => undefined);
-      });
-      await client.send("Page.startScreencast", {
-        format: "jpeg",
-        quality: 55,
-        maxWidth: 1280,
-        maxHeight: 800,
-        everyNthFrame: 2,
+        if (this.cdp === client) live.publishFrame(taskId, Buffer.from(frame.data, "base64"));
       });
       page.on("framenavigated", (frame) => {
         if (frame === page.mainFrame()) live.setState(taskId, { url: frame.url() });
       });
       page.on("close", () => live.stop(taskId));
       live.setState(taskId, { active: true, url: page.url() });
+      this.offDemand = live.onDemand(taskId, (watched) => (watched ? this.startCast(client) : this.stopCast(client)));
+      if (live.viewerCount(taskId) > 0) this.startCast(client);
     } catch {
       this.cdp = undefined;
       live.setState(taskId, { active: false });
+    }
+  }
+
+  private startCast(client: CDPSession): void {
+    if (this.cdp !== client || this.casting) return;
+    this.casting = true;
+    client.send("Page.startScreencast", SCREENCAST).catch(() => {
+      if (this.cdp === client) this.casting = false;
+    });
+  }
+
+  private stopCast(client: CDPSession): void {
+    if (this.cdp !== client || !this.casting) return;
+    this.casting = false;
+    void client.send("Page.stopScreencast").catch(() => undefined);
+  }
+
+  /**
+   * Frame yang membeku di tab Live setelah sesi selesai harus keadaan akhir halaman. Selama screencast
+   * menyala frame terakhirnya sudah terkini; tanpa penonton, ambil satu screenshot.
+   */
+  private async captureFinalFrame(taskId: string): Promise<void> {
+    const client = this.cdp;
+    if (this.casting || !client || !this.page || this.page.isClosed()) return;
+    try {
+      const shot = await within(
+        client.send("Page.captureScreenshot", { format: "jpeg", quality: SCREENCAST.quality }),
+        FINAL_FRAME_TIMEOUT_MS,
+      );
+      if (shot) live.publishFrame(taskId, Buffer.from(shot.data, "base64"));
+    } catch {
+      // halaman sudah rusak — frame terakhir yang ada tetap dipakai
     }
   }
 
@@ -103,21 +178,35 @@ class BrowserSession {
     return this.page;
   }
 
+  private log(line: string): void {
+    this.logs.push(line);
+    if (this.logs.length > MAX_LOGS) {
+      this.logs.shift();
+      this.droppedLogs += 1;
+    }
+  }
+
   drainLogs(): string[] {
-    const logs = this.logs;
+    const logs = this.droppedLogs > 0 ? [`(${this.droppedLogs} log lama dibuang — hanya ${MAX_LOGS} terakhir yang disimpan)`, ...this.logs] : this.logs;
     this.logs = [];
+    this.droppedLogs = 0;
     return logs;
   }
 
   async close(): Promise<void> {
     if (this.taskId) {
+      await this.captureFinalFrame(this.taskId);
+      this.offDemand?.();
+      this.offDemand = undefined;
       live.stop(this.taskId);
       sessions.delete(this.taskId);
     }
-    await this.cdp?.detach().catch(() => undefined);
+    const cdp = this.cdp;
+    this.cdp = undefined;
+    this.casting = false;
+    await cdp?.detach().catch(() => undefined);
     await this.page?.context().close().catch(() => undefined);
     await this.browser?.close().catch(() => undefined);
-    this.cdp = undefined;
     this.page = undefined;
     this.browser = undefined;
   }
@@ -128,14 +217,30 @@ class BrowserSession {
  * `getTaskId` dievaluasi saat tool dipanggil, sehingga screenshot selalu
  * mendarat di folder tugas yang sedang dikerjakan.
  */
-export function createBrowserServer(getTaskId: () => string | undefined) {
-  const session = new BrowserSession(getTaskId);
+export function createBrowserServer(session: BrowserSession, getTaskId: () => string | undefined) {
 
   const shotDir = (): string => {
     const id = getTaskId();
     const dir = id ? assetsDir(id) : join(CONFIG.tasksDir, "_adhoc", "assets");
     mkdirSync(dir, { recursive: true });
     return dir;
+  };
+
+  /** Berkas uji unggahan hidup di run_dir/uploads — ikut tampil di tab Lampiran sebagai bukti. */
+  const uploadDir = (): string => {
+    const id = getTaskId();
+    const dir = id ? join(assetsDir(id), "..", "uploads") : join(CONFIG.tasksDir, "_adhoc", "uploads");
+    mkdirSync(dir, { recursive: true });
+    return resolve(dir);
+  };
+
+  /** Hanya berkas di dalam folder uploads yang boleh diserahkan ke halaman (penutup path traversal). */
+  const resolveUpload = (name: string): string => {
+    const dir = uploadDir();
+    const target = resolve(dir, basename(name));
+    if (!target.startsWith(`${dir}/`)) throw new Error(`${name}: di luar folder uploads`);
+    if (!existsSync(target)) throw new Error(`${name}: tidak ada di ./uploads/ — buat dulu dengan make_file`);
+    return target;
   };
 
   const locate = (page: Page, selector?: string, text?: string) => {
@@ -148,13 +253,13 @@ export function createBrowserServer(getTaskId: () => string | undefined) {
     name: "browser",
     version: "0.1.0",
     instructions:
-      "Browser Chromium headless untuk pengujian QA. Alur yang disarankan: open → snapshot → (click/fill/press/hover/select_option) → scroll/inspect → screenshot → console. Screenshot otomatis disimpan ke folder bukti laporan. " +
+      "Browser Chromium headless untuk pengujian QA dan audit UI/UX. Alur yang disarankan: open → snapshot → (click/fill/press/hover/select_option) → scroll/inspect → screenshot → console. Screenshot otomatis disimpan ke folder bukti laporan. " +
       "Sebelum melaporkan apa pun sebagai terpotong/tidak terlihat/hilang, panggil `inspect` — isi yang bisa di-scroll (scrollWidth > clientWidth dengan overflow auto|scroll) bukan teks terpotong, dan `scroll` bisa menggesernya. " +
       "Dialog native confirm/alert/prompt dibatalkan otomatis kecuali Anda memasang `dialog` lebih dulu.",
     tools: [
       tool(
         "open",
-        "Buka URL di browser dan kembalikan judul serta status halaman.",
+        "Buka URL di browser dan kembalikan judul, status halaman, dan viewport. Isi `width` dan `height` berdua untuk mengganti ukuran viewport; ukuran itu bertahan sampai diganti lagi.",
         {
           url: z.string().describe("URL lengkap termasuk http/https"),
           width: z.number().int().min(320).max(3840).optional(),
@@ -170,7 +275,7 @@ export function createBrowserServer(getTaskId: () => string | undefined) {
             const taskId = getTaskId();
             if (taskId) live.setState(taskId, { url: page.url(), title: await page.title() });
             return ok(
-              `Terbuka: ${page.url()}\nStatus HTTP: ${response?.status() ?? "(tidak ada respons)"}\nJudul: ${await page.title()}`,
+              `Terbuka: ${page.url()}\nStatus HTTP: ${response?.status() ?? "(tidak ada respons)"}\nJudul: ${await page.title()}\nViewport: ${viewportLabel(page)}`,
             );
           } catch (error) {
             return fail(error instanceof Error ? error.message : String(error));
@@ -289,7 +394,8 @@ export function createBrowserServer(getTaskId: () => string | undefined) {
       ),
       tool(
         "inspect",
-        "WAJIB sebelum melaporkan sesuatu sebagai terpotong/tidak terlihat. Melaporkan ukuran, scrollWidth vs clientWidth, overflow, text-overflow, scroller terdekat, dan TEKS PENUH elemen — sehingga jelas apakah isinya cuma perlu di-scroll atau benar-benar terpotong.",
+        "WAJIB sebelum melaporkan sesuatu sebagai terpotong/tidak terlihat. Melaporkan ukuran, scrollWidth vs clientWidth, overflow, text-overflow, scroller terdekat, dan TEKS PENUH elemen — sehingga jelas apakah isinya cuma perlu di-scroll atau benar-benar terpotong. " +
+          "Juga melaporkan warna, background efektif, tipografi, dan rasio kontras WCAG. Background dibaca dari elemen dan ancestor DOM-nya: elemen yang ditumpuk secara absolut di atas elemen lain perlu dicek juga dengan screenshot.",
         {
           selector: z.string().describe("CSS selector; boleh cocok ke beberapa elemen"),
           limit: z.number().int().min(1).max(20).optional().describe("berapa elemen dilaporkan (bawaan 3)"),
@@ -428,6 +534,99 @@ export function createBrowserServer(getTaskId: () => string | undefined) {
             if (!existsSync(target)) return fail(`tidak ada file ${file} di folder bukti`);
             unlinkSync(target);
             return ok(`Bukti ${file} dihapus. Alasan: ${args.reason}`);
+          } catch (error) {
+            return fail(error instanceof Error ? error.message : String(error));
+          }
+        },
+      ),
+      tool(
+        "make_file",
+        "Buat berkas uji dummy di folder ./uploads/ tugas untuk dipakai `upload`. PNG/JPG/PDF valid, CSV/TXT/JSON berisi contoh, `bin` acak untuk uji tipe tak didukung. " +
+          "`sizeKb` memadatkan berkas ke ukuran itu (uji batas ukuran) tanpa merusak formatnya.",
+        {
+          name: z.string().describe("nama berkas dengan ekstensi, mis. foto.png, data.csv, besar.pdf"),
+          kind: z.enum(KINDS as [TestFileKind, ...TestFileKind[]]).optional().describe("bawaan: dari ekstensi nama"),
+          sizeKb: z.number().int().min(1).max(50_000).optional().describe("ukuran akhir dalam KB"),
+          text: z.string().optional().describe("isi untuk csv/txt/json (bawaan: contoh kecil yang valid)"),
+          width: z.number().int().min(1).max(4096).optional().describe("png/jpg, bawaan 320"),
+          height: z.number().int().min(1).max(4096).optional().describe("png/jpg, bawaan 240"),
+        },
+        async (args) => {
+          try {
+            const kind = args.kind ?? kindFromName(args.name);
+            if (!kind) return fail(`ekstensi ${args.name} tidak dikenal — isi \`kind\` (${KINDS.join("/")})`);
+            const safeName = basename(args.name).replace(/[^a-zA-Z0-9._-]/g, "-").slice(0, 80) || `uji.${kind}`;
+            let jpeg: Buffer | undefined;
+            if (kind === "jpg") {
+              // Node tidak punya encoder JPEG; render halaman polos lewat Chromium.
+              const page = await session.getPage();
+              const scratch = await page.context().newPage();
+              try {
+                await scratch.setViewportSize({ width: args.width ?? 320, height: args.height ?? 240 });
+                await scratch.setContent(
+                  `<body style="margin:0;background:linear-gradient(135deg,#dbeafe,#2383e2);font:20px sans-serif;color:#fff;display:grid;place-items:center">${safeName}</body>`,
+                );
+                jpeg = await scratch.screenshot({ type: "jpeg", quality: 80 });
+              } finally {
+                await scratch.close().catch(() => undefined);
+              }
+            }
+            const { buffer, mime } = makeTestFile({ ...args, name: safeName, kind, jpeg });
+            const file = join(uploadDir(), safeName);
+            writeFileSync(file, buffer);
+            return ok(`Berkas uji dibuat: ./uploads/${safeName} (${buffer.length} byte, ${mime}). Pakai \`upload\` dengan files: ["${safeName}"].`);
+          } catch (error) {
+            return fail(error instanceof Error ? error.message : String(error));
+          }
+        },
+      ),
+      tool(
+        "upload",
+        "Serahkan berkas dari ./uploads/ (buat dulu dengan make_file) ke input file halaman. Beri `selector` <input type=file> (boleh tersembunyi), " +
+          "ATAU `clickSelector`/`clickText` tombol kustom yang membuka dialog pilih berkas. Tanpa keduanya dipakai input file pertama di halaman. `files: []` mengosongkan pilihan.",
+        {
+          files: z.array(z.string()).max(20).describe("nama berkas di ./uploads/"),
+          selector: z.string().optional(),
+          clickSelector: z.string().optional(),
+          clickText: z.string().optional(),
+        },
+        async (args) => {
+          try {
+            const page = session.requirePage();
+            const paths = args.files.map(resolveUpload);
+            const before = session.dialogs.count();
+            let target: string;
+            if (args.clickSelector || args.clickText) {
+              const [chooser] = await Promise.all([
+                page.waitForEvent("filechooser", { timeout: 10_000 }),
+                locate(page, args.clickSelector, args.clickText).click({ timeout: 10_000 }),
+              ]);
+              if (paths.length > 1 && !chooser.isMultiple()) {
+                return fail("input ini hanya menerima satu berkas (tanpa atribut multiple) — kirim satu nama saja");
+              }
+              await chooser.setFiles(paths);
+              target = `dialog pilih berkas dari ${args.clickSelector ?? args.clickText}`;
+            } else {
+              const selector = args.selector ?? 'input[type="file"]';
+              const input = page.locator(selector).first();
+              if ((await input.count()) === 0) {
+                return fail(
+                  args.selector
+                    ? `tidak ada elemen ${selector}`
+                    : "tidak ada <input type=file> di halaman — pakai clickSelector/clickText pada tombol unggahnya",
+                );
+              }
+              await input.setInputFiles(paths, { timeout: 10_000 });
+              target = selector;
+            }
+            // Banyak form langsung mengunggah begitu berkas dipilih; beri waktu requestnya jalan.
+            await page.waitForLoadState("networkidle", { timeout: 3_000 }).catch(() => undefined);
+            const dialogs = session.dialogs.takeSince(before);
+            return ok(
+              `${paths.length === 0 ? "Pilihan berkas dikosongkan" : `Terunggah ke ${target}: ${args.files.join(", ")}`}\nURL sekarang: ${page.url()}${
+                dialogs.length > 0 ? `\nDialog native yang muncul:\n${dialogs.join("\n")}` : ""
+              }`,
+            );
           } catch (error) {
             return fail(error instanceof Error ? error.message : String(error));
           }

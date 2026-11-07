@@ -1,30 +1,56 @@
-import { useState } from "react";
-import { api, type UiEvent } from "../api.ts";
+import { memo, useMemo, useState } from "react";
+import { commandOf, toolLabel, toolSummary } from "../activity.ts";
+import { api, ApiError, type UiEvent } from "../api.ts";
 
 type Approval = Extract<UiEvent, { type: "approval" }>;
 type Question = Extract<UiEvent, { type: "question" }>;
 
-function commandOf(input: unknown): string {
-  const record = input as Record<string, unknown> | null;
-  if (record && typeof record.command === "string") return record.command;
-  if (record && typeof record.file_path === "string") return String(record.file_path);
-  return JSON.stringify(input, null, 2);
+/**
+ * Pengiriman keputusan. Tombol hanya terkunci selama permintaan berjalan; kartu hilang begitu
+ * keputusannya tiba lewat stream. 404 berarti permintaannya sudah selesai, bukan gagal dikirim.
+ */
+function useDecision() {
+  const [phase, setPhase] = useState<"idle" | "sending" | "sent" | "expired">("idle");
+  const [error, setError] = useState<string>();
+
+  const submit = async (send: () => Promise<unknown>) => {
+    setPhase("sending");
+    setError(undefined);
+    try {
+      await send();
+      setPhase("sent");
+    } catch (cause) {
+      if (cause instanceof ApiError && cause.status === 404) {
+        setPhase("expired");
+        return;
+      }
+      setError((cause as Error).message);
+      setPhase("idle");
+    }
+  };
+
+  return { phase, error, submit, locked: phase !== "idle" };
+}
+
+function ExpiredRequest() {
+  return <p className="text-xs text-muted">Permintaan ini sudah tidak aktif.</p>;
+}
+
+function DecisionStatus({ phase, error }: { phase: string; error?: string }) {
+  if (error) return <p className="mt-2 text-xs text-tag-red-ink">Gagal mengirim: {error}. Coba lagi.</p>;
+  if (phase === "sent") return <p className="mt-2 text-xs text-muted">Keputusan terkirim.</p>;
+  return null;
 }
 
 export function ApprovalCard({ event }: { event: Approval }) {
-  const [sending, setSending] = useState(false);
+  const { phase, error, submit, locked } = useDecision();
   const [reason, setReason] = useState("");
   const [showReason, setShowReason] = useState(false);
 
-  const act = async (decision: "allow" | "deny", remember = false) => {
-    setSending(true);
-    try {
-      await api.approve(event.approvalId, { decision, remember, message: reason || undefined });
-    } catch (error) {
-      alert((error as Error).message);
-      setSending(false);
-    }
-  };
+  const act = (decision: "allow" | "deny", remember = false) =>
+    submit(() => api.approve(event.approvalId, { decision, remember, message: reason || undefined }));
+
+  if (phase === "expired") return <ExpiredRequest />;
 
   return (
     <div className="rounded-xl border border-line bg-tag-yellow p-4">
@@ -50,7 +76,7 @@ export function ApprovalCard({ event }: { event: Approval }) {
 
       <div className="mt-3 flex flex-wrap gap-2">
         <button
-          disabled={sending}
+          disabled={locked}
           onClick={() => act("allow")}
           className="rounded-lg bg-accent px-3 py-1.5 text-sm font-medium text-on-accent hover:bg-accent-hover disabled:opacity-50"
         >
@@ -58,7 +84,7 @@ export function ApprovalCard({ event }: { event: Approval }) {
         </button>
         {event.canRemember && (
           <button
-            disabled={sending}
+            disabled={locked}
             onClick={() => act("allow", true)}
             className="rounded-lg border border-line-strong px-3 py-1.5 text-sm text-tag-green-ink hover:bg-hover disabled:opacity-50"
           >
@@ -66,32 +92,25 @@ export function ApprovalCard({ event }: { event: Approval }) {
           </button>
         )}
         <button
-          disabled={sending}
+          disabled={locked}
           onClick={() => (showReason ? act("deny") : setShowReason(true))}
           className="rounded-lg border border-tag-red-ink px-3 py-1.5 text-sm text-tag-red-ink hover:bg-tag-red disabled:opacity-50"
         >
           {showReason ? "Kirim penolakan" : "Tolak"}
         </button>
       </div>
+      <DecisionStatus phase={phase} error={error} />
     </div>
   );
 }
 
 export function QuestionCard({ event }: { event: Question }) {
   const [answers, setAnswers] = useState<Record<string, string>>({});
-  const [sending, setSending] = useState(false);
-
-  const submit = async () => {
-    setSending(true);
-    try {
-      await api.answer(event.questionId, answers);
-    } catch (error) {
-      alert((error as Error).message);
-      setSending(false);
-    }
-  };
+  const { phase, error, submit, locked } = useDecision();
 
   const complete = event.questions.every((question) => answers[question.question]);
+
+  if (phase === "expired") return <ExpiredRequest />;
 
   return (
     <div className="rounded-xl border border-line bg-tag-blue p-4">
@@ -127,17 +146,19 @@ export function QuestionCard({ event }: { event: Question }) {
         </div>
       ))}
       <button
-        disabled={sending || !complete}
-        onClick={submit}
+        disabled={locked || !complete}
+        onClick={() => submit(() => api.answer(event.questionId, answers))}
         className="mt-3 rounded-lg bg-accent px-3 py-1.5 text-sm font-medium text-on-accent hover:bg-accent-hover disabled:opacity-50"
       >
         Kirim jawaban
       </button>
+      <DecisionStatus phase={phase} error={error} />
     </div>
   );
 }
 
-export function ToolCall({
+/** Ribuan baris tool di satu thread: hanya render ulang kalau event/hasilnya memang berubah. */
+export const ToolCall = memo(function ToolCall({
   name,
   input,
   result,
@@ -147,9 +168,8 @@ export function ToolCall({
   result?: Extract<UiEvent, { type: "tool_result" }>;
 }) {
   const [open, setOpen] = useState(false);
-  // mcp__browser__screenshot → browser.screenshot
-  const label = name.replace(/^mcp__([^_]+(?:_[^_]+)*)__/, (_match, server: string) => `${server}.`);
-  const summary = commandOf(input).split("\n")[0]?.slice(0, 110) ?? "";
+  const label = toolLabel(name);
+  const summary = useMemo(() => toolSummary(input), [input]);
   const state = !result ? "berjalan" : result.isError ? "gagal" : "selesai";
   const tone = !result ? "text-tag-blue-ink" : result.isError ? "text-tag-red-ink" : "text-muted";
 
@@ -172,4 +192,4 @@ export function ToolCall({
       )}
     </div>
   );
-}
+});

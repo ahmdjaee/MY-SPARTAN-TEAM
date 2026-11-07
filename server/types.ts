@@ -1,4 +1,4 @@
-export type RoleId = "qa" | "engineer" | "devops";
+export type RoleId = "qa" | "engineer" | "devops" | "uiux";
 
 /** Seberapa bebas agen bertindak dalam satu tugas. */
 export type AutonomyMode = "auto" | "ask" | "readonly";
@@ -11,6 +11,8 @@ export type AttentionEvent = {
   title: string;
   detail?: string;
   at: string;
+  /** Tidak perlu notifikasi browser (Stop dari owner sendiri, atau turn berikutnya langsung jalan); kurator tetap terpicu. */
+  silent?: boolean;
 };
 
 /** Status runner agen untuk satu tugas (beda dengan status tugas itu sendiri). */
@@ -22,6 +24,9 @@ export type AskQuestion = {
   multiSelect?: boolean;
   options: { label: string; description?: string }[];
 };
+
+/** Pemakaian konteks sesi; maxTokens adalah batas tempat auto-compact terjadi. */
+export type ContextUsage = { usedTokens: number; maxTokens: number; percentage: number };
 
 export type UiEvent =
   | { type: "user"; text: string; from?: "owner" | "system" }
@@ -59,13 +64,24 @@ export type UiEvent =
       isError: boolean;
       durationMs: number;
       numTurns: number;
+      /** Total berjalan sesi (`total_cost_usd`), bukan biaya turn ini. */
       costUsd?: number;
+      /** Biaya turn ini saja: selisih total sesi terhadap result sebelumnya. Kosong di event lama. */
+      turnCostUsd?: number;
+      /** Turn dihentikan owner (Stop/batal/oper) — bukan kegagalan. */
+      interrupted?: boolean;
+      /** Turn yang dimulai CLI sendiri (mis. notifikasi Bash background), bukan jawaban atas pesan kita. */
+      background?: boolean;
     }
   | { type: "handoff"; from: RoleId; to: RoleId; note?: string }
   | { type: "notice"; text: string }
+  /** report.md baru saja ditulis agen — tab Laporan memuat ulang. Tidak disimpan. */
+  | { type: "report_changed" }
+  | { type: "compact"; trigger: "auto" | "manual"; preTokens: number; postTokens?: number }
+  | ({ type: "context" } & ContextUsage)
   | { type: "error"; message: string };
 
 export type StoredEvent = UiEvent & { seq: number; ts: string; taskId: string; role: RoleId };
 
 /** Event yang hanya relevan saat live, tidak ditulis ke transcript. */
-export const EPHEMERAL_EVENTS = new Set(["delta", "status"]);
+export const EPHEMERAL_EVENTS = new Set(["delta", "status", "context", "report_changed"]);

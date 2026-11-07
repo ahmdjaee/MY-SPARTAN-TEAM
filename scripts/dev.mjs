@@ -1,9 +1,9 @@
-/** Jalankan API (tsx) dan Vite bersamaan tanpa dependency tambahan. */
+/** Jalankan API dan Vite bersamaan tanpa dependency tambahan. */
 import { spawn } from "node:child_process";
 
 const children = [
-  spawn("npx", ["tsx", "server/main.ts"], { stdio: "inherit" }),
-  spawn("npx", ["vite"], { stdio: "inherit" }),
+  spawn("bun", ["server/main.ts"], { stdio: "inherit" }),
+  spawn("bun", ["--bun", "vite"], { stdio: "inherit" }),
 ];
 
 const stop = () => {

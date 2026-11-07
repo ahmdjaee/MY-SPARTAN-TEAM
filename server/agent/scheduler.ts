@@ -1,22 +1,23 @@
 import { CONFIG } from "../config.ts";
-import { workspaceForTask } from "../context.ts";
 import { composeHandoffMessage, composeOpeningMessage, composeReviewMessage } from "../messages.ts";
 import { ROLES } from "../roles.ts";
 import { defaultModeFor } from "../settings.ts";
 import {
+  ACTIVE_STATUSES,
   activeTasks,
   addAssignment,
-  addCost,
   currentAssignment,
   extractHandoffSummary,
   getTask,
+  hasHandoffSummary,
   patchAssignment,
+  recordSessionCost,
   updateTask,
   type Task,
 } from "../tasks.ts";
 import type { AutonomyMode, RoleId, WorkerStatus } from "../types.ts";
 import { bus } from "./bus.ts";
-import { TaskRunner } from "./runner.ts";
+import { TaskRunner, type TurnOutcome } from "./runner.ts";
 import { Semaphore } from "./semaphore.ts";
 
 /** Role yang menulis ke workspace: hanya boleh satu yang aktif pada satu waktu. */
@@ -58,21 +59,29 @@ class Scheduler {
   }
 
   /**
-   * Urutan sengaja: kunci workspace dulu, baru slot. Dengan begitu tugas kode yang
-   * menunggu gilirannya tidak menahan slot yang bisa dipakai tugas QA.
+   * Kunci workspace terpisah dari slot. Runner mengambil kunci dulu, baru slot — tugas kode yang
+   * menunggu gilirannya tidak menahan slot yang bisa dipakai tugas QA. Kunci dipegang sepanjang
+   * turn, termasuk saat menunggu keputusan owner (slotnya dilepas).
+   *
+   * Bebas deadlock: tidak ada jalur yang meminta kunci sambil memegang slot.
    */
-  private acquire = async (role: RoleId, taskId: string): Promise<(() => void)> => {
-    const dir = WRITES_WORKSPACE.includes(role) ? workspaceForTask(taskId) : undefined;
-    if (dir) await this.acquireWorkspace(dir);
-    const releaseSlot = await this.slots.acquire();
+  private lockWorkspace = async (role: RoleId, dir: string): Promise<(() => void) | undefined> => {
+    if (!WRITES_WORKSPACE.includes(role)) return undefined;
+    // Folder dari runner (cwd sesi yang hidup) dan ditangkap di sini: tugas yang dipindah project di
+    // tengah turn tetap mengunci dan melepas folder yang benar-benar ditulis CLI.
+    await this.acquireWorkspace(dir);
     let released = false;
     return () => {
       if (released) return;
       released = true;
-      releaseSlot();
-      if (dir) this.releaseWorkspace(dir);
+      this.releaseWorkspace(dir);
     };
   };
+
+  /** Slot agen untuk pekerjaan di luar tugas (kurator), supaya ikut batas MAX_CONCURRENT_AGENTS. */
+  acquireSlot(): Promise<() => void> {
+    return this.slots.acquire();
+  }
 
   // ---------- runner ----------
 
@@ -82,13 +91,18 @@ class Scheduler {
     if (existing) void existing.close();
 
     const runner = new TaskRunner(task.id, task.role, {
-      acquire: (role) => this.acquire(role, task.id),
+      acquire: () => this.slots.acquire(),
+      lockWorkspace: (role, dir) => this.lockWorkspace(role, dir),
       onSession: (taskId, sessionId) => {
         patchAssignment(taskId, { sessionId });
       },
+      onCost: (taskId, sessionId, totalUsd, options) => recordSessionCost(taskId, sessionId, totalUsd, options),
       onStatus: (taskId, status) => this.onStatus(taskId, status),
       onTurnEnd: (taskId, outcome) => this.onTurnEnd(taskId, outcome),
-      onIdleShutdown: () => undefined,
+      onIdleShutdown: (taskId) => this.onIdleShutdown(taskId),
+      onContext: (taskId, usage) => {
+        patchAssignment(taskId, { context: { ...usage, at: new Date().toISOString() } });
+      },
     }, currentAssignment(task).sessionId, task.mode ?? defaultModeFor(task.role));
 
     this.runners.set(task.id, runner);
@@ -119,32 +133,58 @@ class Scheduler {
     }
   }
 
-  private onTurnEnd(
-    taskId: string,
-    outcome: { subtype: string; isError: boolean; costUsd?: number; lastText: string },
-  ): void {
+  /** Sesi idle sudah ditutup; tugas yang tidak aktif lagi tidak perlu menahan runner (dan browsernya). */
+  private onIdleShutdown(taskId: string): void {
+    const runner = this.runners.get(taskId);
+    const task = getTask(taskId);
+    if (!runner || !task || ACTIVE_STATUSES.includes(task.status)) return;
+    this.runners.delete(taskId);
+    void runner.close();
+  }
+
+  /** Biaya sudah dicatat runner lewat `onCost` (selisih total sesi), bukan di sini. */
+  private onTurnEnd(taskId: string, outcome: TurnOutcome): void {
     const task = getTask(taskId);
     if (!task) return;
+    // Turn yang dimulai CLI sendiri (mis. job Bash background selesai) tidak membuka lagi tugas yang
+    // sudah Anda setujui atau batalkan.
+    if (outcome.background && (task.status === "done" || task.status === "cancelled")) return;
+    // Stop dari owner berakhir dengan result error_during_execution — itu bukan kegagalan.
+    const failed = outcome.isError && !outcome.interrupted;
     if (task.status !== "cancelled") {
+      const title = ROLES[task.role].title;
       bus.publishAttention({
-        kind: outcome.isError ? "failed" : "needs_review",
+        kind: failed ? "failed" : "needs_review",
         taskId,
         role: task.role,
-        title: outcome.isError
-          ? `${ROLES[task.role].title} gagal menyelesaikan ${taskId}`
-          : `${ROLES[task.role].title} selesai — ${taskId} perlu dibaca`,
+        title: failed
+          ? `${title} gagal menyelesaikan ${taskId}`
+          : outcome.interrupted
+            ? `${title} dihentikan — ${taskId}`
+            : `${title} selesai — ${taskId} perlu dibaca`,
         detail: task.title,
         at: new Date().toISOString(),
+        // Stop dari Anda sendiri, atau pesan berikutnya langsung jalan: tidak perlu notifikasi.
+        ...(outcome.interrupted || outcome.followUp ? { silent: true } : {}),
       });
     }
-    if (outcome.costUsd) addCost(taskId, outcome.costUsd);
-    if (outcome.lastText.trim()) patchAssignment(taskId, { summary: extractHandoffSummary(outcome.lastText) });
-    if (task.status === "cancelled") return;
 
-    updateTask(taskId, {
-      status: outcome.isError ? "failed" : "needs_review",
-      finishedAt: new Date().toISOString(),
-    });
+    // Ringkasan dan status ditulis sekali; turn yang terpotong bukan ringkasan serah terima. Turn yang
+    // dimulai CLI ("Build selesai.") baru menggantikannya kalau ia menulis bagian serah terima sendiri.
+    const patch: Partial<Task> = {};
+    if (!outcome.interrupted && outcome.lastText.trim() && (!outcome.background || hasHandoffSummary(outcome.lastText))) {
+      const assignments = [...task.assignments];
+      const last = assignments[assignments.length - 1];
+      if (last) {
+        assignments[assignments.length - 1] = { ...last, summary: extractHandoffSummary(outcome.lastText) };
+        patch.assignments = assignments;
+      }
+    }
+    if (task.status !== "cancelled" && !outcome.followUp) {
+      patch.status = failed ? "failed" : "needs_review";
+      patch.finishedAt = new Date().toISOString();
+    }
+    if (Object.keys(patch).length > 0) updateTask(taskId, patch);
   }
 
   // ---------- perintah ----------
@@ -160,7 +200,8 @@ class Scheduler {
   send(taskId: string, text: string, options?: { display?: string; from?: "owner" | "system" }): boolean {
     const task = getTask(taskId);
     if (!task) return false;
-    updateTask(taskId, { status: "queued", finishedAt: undefined });
+    // Tugas yang sedang jalan atau menunggu keputusan tetap di statusnya; pesannya masuk antrean runner.
+    if (!ACTIVE_STATUSES.includes(task.status)) updateTask(taskId, { status: "queued", finishedAt: undefined });
     this.runnerFor(task).send(text, options);
     return true;
   }
@@ -173,7 +214,10 @@ class Scheduler {
   }
 
   async interrupt(taskId: string): Promise<void> {
-    await this.runners.get(taskId)?.interrupt();
+    const runner = this.runners.get(taskId);
+    await runner?.interrupt();
+    // Pesan yang dikirim tepat setelah Stop mungkin sudah jalan lagi — statusnya jangan ditimpa.
+    if (runner && runner.status !== "idle") return;
     const task = getTask(taskId);
     if (task && (task.status === "running" || task.status === "waiting" || task.status === "queued")) {
       updateTask(taskId, { status: "needs_review" });
