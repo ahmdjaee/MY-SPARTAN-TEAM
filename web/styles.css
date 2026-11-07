@@ -194,3 +194,20 @@ body {
   content-visibility: auto;
   contain-intrinsic-size: auto 48px;
 }
+
+/* Overlay tab Live: kursor bot meluncur ke target, riak saat klik, kilat saat screenshot. */
+.live-cursor { transition: transform 380ms cubic-bezier(0.22, 1, 0.36, 1); }
+.live-ripple { animation: live-ripple 650ms ease-out forwards; }
+.live-flash { animation: live-flash 350ms ease-out forwards; }
+@keyframes live-ripple {
+  from { transform: scale(0.3); opacity: 0.9; }
+  to { transform: scale(1.6); opacity: 0; }
+}
+@keyframes live-flash {
+  from { opacity: 0.55; }
+  to { opacity: 0; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .live-cursor { transition: none; }
+  .live-ripple, .live-flash { animation: none; opacity: 0; }
+}

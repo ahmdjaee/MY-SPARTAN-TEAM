@@ -106,10 +106,14 @@ function connect(): void {
   ws.onmessage = (message) => {
     if (socket !== ws) return;
     armSilence(ws);
-    let data: { sid?: number; op?: string; event?: unknown; error?: string };
+    let data: { sid?: number; op?: string; event?: unknown; error?: string; task?: string; ok?: boolean };
     try {
       data = JSON.parse(String(message.data)) as typeof data;
     } catch {
+      return;
+    }
+    if (data.op === "control" && typeof data.task === "string") {
+      controlWaiters.get(data.task)?.shift()?.({ ok: data.ok === true, error: data.error });
       return;
     }
     if (data.sid === undefined) return; // hb
@@ -148,6 +152,49 @@ export function subscribe<T>(topic: string, onEvent: (event: T) => void, options
     if (!subscriptions.delete(subscription.sid)) return;
     write({ op: "unsub", sid: subscription.sid });
   };
+}
+
+export type ControlAnswer = { ok: boolean; error?: string };
+const controlWaiters = new Map<string, Array<(answer: ControlAnswer) => void>>();
+/** Jawaban server yang tidak datang dalam selang ini dianggap gagal (sambungan sedang bermasalah). */
+const CONTROL_TIMEOUT_MS = 5_000;
+
+/**
+ * Ambil alih / serahkan browser bot sebuah tugas (tab Live). Kendali melekat ke sambungan ini:
+ * kalau sambungannya putus, server mengembalikan kendali ke agen.
+ */
+export function requestControl(task: string, action: "take" | "release"): Promise<ControlAnswer> {
+  if (!socket || !open) return Promise.resolve({ ok: false, error: "tidak tersambung ke server" });
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (answer: ControlAnswer) => {
+      if (settled) return;
+      settled = true;
+      resolve(answer);
+    };
+    const list = controlWaiters.get(task) ?? [];
+    list.push(finish);
+    controlWaiters.set(task, list);
+    write({ op: "control", task, action });
+    setTimeout(() => {
+      const waiting = controlWaiters.get(task);
+      const index = waiting?.indexOf(finish) ?? -1;
+      if (waiting && index >= 0) waiting.splice(index, 1);
+      finish({ ok: false, error: "server tidak menjawab" });
+    }, CONTROL_TIMEOUT_MS);
+  });
+}
+
+/** Input owner ke browser bot; diabaikan server kalau sambungan ini tidak memegang kendali. */
+export type OwnerInput =
+  | { t: "move"; x: number; y: number }
+  | { t: "down" | "up"; x: number; y: number; button: "left" | "right" | "middle"; clicks: number }
+  | { t: "wheel"; x: number; y: number; dx: number; dy: number }
+  | { t: "key"; phase: "down" | "up"; key: string; ctrl?: boolean; meta?: boolean }
+  | { t: "text"; text: string };
+
+export function sendInput(task: string, input: OwnerInput): void {
+  write({ op: "input", task, input });
 }
 
 /** Status sambungan, untuk penanda "terputus": `true` saat tersambung, `false` tiap kali putus atau gagal menyambung. */

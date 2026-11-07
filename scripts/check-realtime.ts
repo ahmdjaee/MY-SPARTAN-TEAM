@@ -84,7 +84,7 @@ await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
 const port = (server.address() as { port: number }).port;
 const base = `ws://127.0.0.1:${port}/api/ws`;
 
-type Message = { sid?: number; op?: string; event?: Record<string, any>; error?: string };
+type Message = { sid?: number; op?: string; event?: Record<string, any>; error?: string; ok?: boolean };
 
 async function connect(headers?: Record<string, string>) {
   const ws = new WebSocket(base, { headers } as never);
@@ -242,6 +242,36 @@ check("WebSocket dari Origin aplikasi tersambung", client.opened);
     first?.type === "snapshot" && Array.isArray(first.messages) && first.models?.length === 2,
     first,
   );
+}
+
+// ---------- live: aksi overlay hanya selama disimak ----------
+{
+  check("live: tanpa langganan tidak ada penyimak aksi", live.actionWatcherCount(task.id) === 0);
+  client.send({ op: "sub", sid: 7, topic: `live:${task.id}` });
+  await client.until(() => client.of(7).some((message) => message.op === "ready"));
+  check("live: langganan memasang penyimak aksi", live.actionWatcherCount(task.id) === 1);
+  live.publishAction(task.id, { kind: "click", label: "Mengklik “Masuk”", box: { x: 1, y: 2, width: 3, height: 4 }, at: 1 });
+  await client.until(() => client.events(7).some((event) => event.type === "browser_action"));
+  const action = client.events(7).find((event) => event.type === "browser_action");
+  check("live: aksi sampai sebagai browser_action", action?.kind === "click" && action.box?.width === 3, action);
+  client.send({ op: "unsub", sid: 7 });
+  await wait(30);
+  check("live: unsub melepas penyimak aksi", live.actionWatcherCount(task.id) === 0);
+  client.send({ op: "sub", sid: 8, topic: "live:T-999" });
+  await client.until(() => client.of(8).length > 0);
+  check("live: tugas yang tidak ada ditolak", client.of(8).some((message) => typeof message.error === "string"));
+}
+
+// ---------- ambil alih: hanya untuk browser yang hidup ----------
+{
+  client.send({ op: "control", task: task.id, action: "take" });
+  await client.until(() => client.inbox.some((message) => message.op === "control"));
+  const answer = client.inbox.find((message) => message.op === "control");
+  check("control: tanpa browser bot yang hidup, ambil alih ditolak", answer?.ok === false && typeof answer.error === "string", answer);
+  client.send({ op: "input", task: task.id, input: { t: "text", text: "abc" } });
+  client.send({ op: "input", task: task.id, input: { t: "move", x: "x" } });
+  await wait(50);
+  check("control: input tanpa kendali / tidak valid diabaikan tanpa memutus sambungan", client.ws.readyState === WebSocket.OPEN);
 }
 
 // ---------- shutdown ----------

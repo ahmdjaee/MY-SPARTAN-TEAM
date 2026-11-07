@@ -23,6 +23,7 @@
     "check:runner": "bun scripts/check-runner.ts",
     "check:realtime": "bun scripts/check-realtime.ts",
     "check:live": "bun scripts/check-live.ts",
+    "check:control": "bun scripts/check-control.ts",
     "fix:costs": "bun scripts/fix-costs.ts",
     "gate:suggest": "bun scripts/gates/suggest-collapse.ts",
     "gate:recap": "bun scripts/gates/project-recap.ts",

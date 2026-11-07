@@ -8,6 +8,7 @@ import {
   type SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
 import { BrowserSession, closeBrowserFor, createBrowserServer } from "../browser/mcp.ts";
+import { control } from "../browser/control.ts";
 import { CONFIG, agentEnv } from "../config.ts";
 import { contextBlock, workspaceForTask } from "../context.ts";
 import { ROLES, permissionsFor, resolvePermissionMode } from "../roles.ts";
@@ -573,6 +574,11 @@ export class TaskRunner {
     if (this.closed || this.turn) return;
     this.idleTimer = setTimeout(() => {
       if (this.busy || this.turn || this.backgroundTurn || this.inbox.length > 0 || this.pending.size > 0) return;
+      // Owner sedang memakai browser bot dari tab Live: jangan tutup di bawah tangannya, coba lagi nanti.
+      if (control.isHeld(this.taskId)) {
+        this.startIdleTimer();
+        return;
+      }
       this.stopSession();
       this.hooks.onIdleShutdown(this.taskId);
     }, CONFIG.idleShutdownMs);

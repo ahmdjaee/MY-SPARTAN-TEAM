@@ -134,9 +134,18 @@ Semua warna komponen memakai token semantik (`bg-page`, `bg-panel`, `text-ink`, 
 Tab **Live** di panel tugas menampilkan isi browser QA saat itu juga — halaman yang sedang dibuka, form yang sedang diisi, pesan error yang muncul. Di bawahnya tertulis aksi browser terakhir, dan di daftar tugas ada titik merah `● live` untuk tugas yang browsernya sedang hidup.
 
 - Panel menyala sendiri begitu QA membuka halaman; tugas yang live-nya aktif langsung membuka tab Live saat dipilih.
-- **Menonton saja** — klik Anda tidak diteruskan ke halaman. Untuk mengarahkan QA, kirim pesan di tab Kerja atau tekan Stop.
+- **Aksi bot terlihat** di atas gambar: kursor meluncur ke elemen yang disentuh, riak saat klik, kotak sorot pada elemen target, dan keterangan di pojok kiri bawah ("Mengklik “Masuk”", "Mengisi “Email”: …", tombol keyboard yang ditekan, kilat saat screenshot). Isi field password selalu tampil sebagai `••••••`.
+  Overlay ini digambar di UI, bukan di halaman, jadi screenshot bukti dan `snapshot`/`inspect` bot tidak ikut berubah. Posisi elemen hanya diukur selama ada yang membuka tab Live (topik WebSocket `live:<id>`); tanpa penonton tool browser bekerja persis seperti sebelumnya.
+- **Ambil alih** — tombol di kanan atas tab Live menyerahkan browser bot ke Anda: klik, gulung, ketik, dan paste langsung di gambar (mis. untuk login 2FA, captcha, atau menunjukkan langkah). Selama itu setiap tool browser bot **menunggu** (paling lama 10 menit; Stop membatalkannya), tanpa menginterupsi modelnya. **Serahkan ke bot** mengembalikannya, dan hasil tool bot berikutnya diawali ringkasan seperti *"Owner sempat mengambil alih browser selama 1m20s. Aksi owner: klik “Masuk”; mengetik 12 karakter di “Email”"*.
+  - Isi ketikan Anda **tidak pernah** dikirim ke bot, ditulis ke transcript, atau dicatat — hanya jumlah karakter dan nama field-nya.
+  - Kendali melekat ke tab browser yang memintanya: menutup tab itu, pindah tugas, atau sambungan putus langsung mengembalikan kendali ke bot. Browser bot juga tidak ditutup idle selama Anda memegangnya.
+  - Thread tugas mencatat kapan kendali diambil dan dikembalikan.
 - Tombol **Buka di tab baru** menampilkan aliran gambarnya penuh satu layar (`/api/tasks/<id>/live`, MJPEG biasa).
 - Setelah sesi browser berakhir, frame terakhir dibiarkan membeku di panel; bukti permanennya tetap screenshot di tab Laporan.
+
+**Bot yang melihat layar.** Selain tool berbasis selector, QA dan UI/UX punya tool seperti computer use: `view` (gambar layar sekarang, diperkecil ke sisi panjang 1280 px supaya tidak diperkecil lagi oleh API) lalu `click_at`, `type_text`, `scroll_at`, `drag`, dan `move` dengan koordinat piksel gambar itu. Dipakai untuk canvas, peta, grafik, slider, drag & drop, atau pemeriksaan visual; untuk form dan tombol biasa bot tetap memakai `snapshot` + `click`/`fill` karena lebih presisi dan lebih hemat. Gambar `view` bukan bukti laporan — bukti tetap `screenshot`.
+
+`bun run check:control` menguji ketiga fitur ini (overlay, ambil alih, tool layar) dengan Chromium sungguhan, tanpa model.
 
 Secara teknis: CDP `Page.startScreencast` → JPEG (lebar 1280, hingga 60 fps — setiap gambar Chromium selama halaman berubah) → MJPEG lewat `multipart/x-mixed-replace`. Header frame berikutnya langsung dikirim di belakang tiap frame, karena Chrome baru menampilkan satu frame MJPEG setelah header frame berikutnya datang. Screencast hanya menyala selama ada yang menonton: tanpa penonton (tab Live tertutup atau tab browser disembunyikan) ia berhenti ±3 detik kemudian supaya Chromium tidak membakar CPU, dan saat tab Live dibuka lagi frame keadaan sekarang datang dalam ±25 ms. Sesi browser yang ditutup tanpa penonton menyimpan satu screenshot penutup, jadi frame yang membeku adalah keadaan akhir halaman. Kalau screencast gagal, fitur ini mati diam-diam dan pengujian tetap berjalan.
 

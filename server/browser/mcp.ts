@@ -1,11 +1,13 @@
 import { existsSync, mkdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
-import { createSdkMcpServer, tool } from "@anthropic-ai/claude-agent-sdk";
-import { chromium, type Browser, type CDPSession, type Page } from "playwright";
+import { createSdkMcpServer, tool, type SdkMcpToolDefinition } from "@anthropic-ai/claude-agent-sdk";
+import { chromium, type Browser, type CDPSession, type Locator, type Page } from "playwright";
 import { z } from "zod";
 import { CONFIG } from "../config.ts";
-import { assetsDir } from "../tasks.ts";
-import { live } from "./live.ts";
+import { bus } from "../agent/bus.ts";
+import { assetsDir, getTask } from "../tasks.ts";
+import { control, type OwnerInput } from "./control.ts";
+import { live, type Box, type BrowserAction } from "./live.ts";
 import { KINDS, kindFromName, makeTestFile, type TestFileKind } from "./files.ts";
 import { DialogWatcher, formatInspect, formatScroll, inspect, readText, scroll } from "./ops.ts";
 
@@ -19,8 +21,105 @@ function viewportLabel(page: Page): string {
   return size ? `${size.width}×${size.height}` : "(tidak diketahui)";
 }
 
+/** Elemen target sebuah aksi, untuk overlay tab Live. */
+type Target = { box: Box; name: string; secret: boolean };
+
+/** Batas mengukur elemen untuk overlay — jauh di bawah timeout aksi supaya tool tidak terasa melambat. */
+const PROBE_TIMEOUT_MS = 1_000;
+
+/**
+ * Dijalankan DI halaman (diserialisasi Playwright), jadi harus mandiri. Nilai input tidak pernah
+ * dibaca: nama diambil dari aria-label, <label>, placeholder, teks, atau atribut name.
+ */
+function describeElement(el: Element): Target {
+  const clean = (value: string | null | undefined): string => (value ?? "").replace(/\s+/g, " ").trim();
+  const rect = el.getBoundingClientRect();
+  const input = el instanceof HTMLInputElement ? el : null;
+  const field = input !== null || el instanceof HTMLTextAreaElement || el instanceof HTMLSelectElement;
+  const labelled = (el as HTMLInputElement).labels?.[0];
+  const name =
+    clean(el.getAttribute("aria-label")) ||
+    (labelled ? clean(labelled.innerText) : "") ||
+    clean(el.getAttribute("placeholder")) ||
+    (field ? "" : clean((el as HTMLElement).innerText)) ||
+    clean(el.getAttribute("name")) ||
+    clean(el.getAttribute("title")) ||
+    el.tagName.toLowerCase();
+  return {
+    box: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
+    name: name.slice(0, 60),
+    secret: input?.type === "password",
+  };
+}
+
 /** Sesi browser yang sedang hidup, supaya bisa ditutup dari luar saat tugas berakhir. */
 const sessions = new Map<string, BrowserSession>();
+
+// Kendali owner → keadaan Live (tombol & banner di UI) dan catatan di thread tugas.
+control.onChange((taskId, since) => {
+  live.setState(taskId, { controlledSince: since });
+  const role = getTask(taskId)?.role;
+  if (!role) return;
+  bus.emit(taskId, role, {
+    type: "notice",
+    text: since ? "Owner mengambil alih browser — tool browser agen menunggu." : "Kendali browser dikembalikan ke agen.",
+  });
+});
+
+/** Ada browser hidup untuk tugas ini (syarat ambil alih)? */
+export function browserActiveFor(taskId: string): boolean {
+  return sessions.get(taskId)?.hasPage() ?? false;
+}
+
+/** Teruskan input owner ke browser tugas. `false` kalau tidak ada browser yang hidup. */
+export function ownerInput(taskId: string, input: OwnerInput): boolean {
+  const session = sessions.get(taskId);
+  if (!session?.hasPage()) return false;
+  session.ownerInput(input);
+  return true;
+}
+
+/**
+ * Gambar `view` untuk agen dibatasi supaya API tidak memperkecilnya lagi — kalau diperkecil,
+ * koordinat yang agen baca dari gambar tidak lagi cocok dengan halaman.
+ */
+const VIEW_MAX_EDGE = 1280;
+const VIEW_MAX_PIXELS = 1_150_000;
+
+/** Skala viewport → gambar `view`. Ditentukan dari ukuran viewport saja, jadi selalu bisa dihitung ulang. */
+export function viewScale(viewport: { width: number; height: number }): number {
+  const { width, height } = viewport;
+  return Math.min(1, VIEW_MAX_EDGE / Math.max(width, height), Math.sqrt(VIEW_MAX_PIXELS / (width * height)));
+}
+
+/** Elemen teratas di sebuah titik viewport, untuk keterangan aksi. Tidak pernah melempar. */
+async function describeAt(page: Page, x: number, y: number): Promise<Target | undefined> {
+  try {
+    const handle = await page.evaluateHandle(([px, py]) => document.elementFromPoint(px, py), [x, y] as const);
+    const element = handle.asElement();
+    const target = element ? await element.evaluate(describeElement) : undefined;
+    await handle.dispose();
+    return target;
+  } catch {
+    return undefined;
+  }
+}
+
+async function describeFocused(page: Page): Promise<Target | undefined> {
+  try {
+    const handle = await page.evaluateHandle(() => document.activeElement);
+    const element = handle.asElement();
+    const target = element ? await element.evaluate(describeElement) : undefined;
+    await handle.dispose();
+    return target;
+  } catch {
+    return undefined;
+  }
+}
+
+const MOUSE_NOTE: Record<string, string> = { left: "klik", right: "klik kanan", middle: "klik tengah" };
+/** Tombol non-karakter yang layak dicatat di ringkasan owner (panah, Backspace, dll. terlalu ramai). */
+const NOTED_KEYS = new Set(["Enter", "Escape", "Tab"]);
 
 /**
  * Screencast tab Live: setiap gambar Chromium headless (60 per detik), hanya saat halaman berubah.
@@ -69,8 +168,131 @@ export class BrowserSession {
   /** Log lama yang dibuang karena melewati MAX_LOGS sejak drain terakhir. */
   private droppedLogs = 0;
   readonly dialogs = new DialogWatcher();
+  /** Input owner dijalankan berurutan; gerakan mouse yang menumpuk dibuang. */
+  private inputChain: Promise<void> = Promise.resolve();
+  private queuedMoves = 0;
+  /** Nama field yang sedang diketik owner (direset saat klik/Tab) — hanya untuk menghitung karakter. */
+  private typingField?: string;
 
   constructor(private readonly getTaskId: () => string | undefined) {}
+
+  hasPage(): boolean {
+    return Boolean(this.page && !this.page.isClosed());
+  }
+
+  ownerInput(input: OwnerInput): void {
+    if (!this.hasPage()) return;
+    if (input.t === "move") {
+      if (this.queuedMoves >= 2) return;
+      this.queuedMoves += 1;
+    }
+    this.inputChain = this.inputChain
+      .then(() => this.applyInput(input))
+      .catch(() => undefined)
+      .finally(() => {
+        if (input.t === "move") this.queuedMoves -= 1;
+      });
+  }
+
+  private async applyInput(input: OwnerInput): Promise<void> {
+    const page = this.page;
+    const taskId = this.taskId;
+    if (!page || page.isClosed() || !taskId) return;
+    const size = page.viewportSize() ?? { width: 1_000_000, height: 1_000_000 };
+    const clampX = (x: number) => Math.min(Math.max(0, x), size.width - 1);
+    const clampY = (y: number) => Math.min(Math.max(0, y), size.height - 1);
+
+    switch (input.t) {
+      case "move":
+        await page.mouse.move(clampX(input.x), clampY(input.y));
+        return;
+      case "down": {
+        const x = clampX(input.x);
+        const y = clampY(input.y);
+        await page.mouse.move(x, y);
+        const target = await describeAt(page, x, y);
+        const verb = input.clicks > 1 && input.button === "left" ? "klik ganda" : MOUSE_NOTE[input.button];
+        control.note(taskId, `${verb} “${target?.name ?? "halaman"}”`);
+        this.typingField = undefined;
+        await page.mouse.down({ button: input.button, clickCount: input.clicks });
+        return;
+      }
+      case "up":
+        await page.mouse.move(clampX(input.x), clampY(input.y));
+        await page.mouse.up({ button: input.button, clickCount: input.clicks });
+        return;
+      case "wheel":
+        await page.mouse.move(clampX(input.x), clampY(input.y));
+        await page.mouse.wheel(input.dx, input.dy);
+        control.note(taskId, "menggulung halaman");
+        return;
+      case "key": {
+        if (input.phase === "up") {
+          await page.keyboard.up(input.key).catch(() => undefined);
+          return;
+        }
+        const printable = [...input.key].length === 1 && !input.ctrl && !input.meta;
+        if (printable) await this.countTyping(page, taskId, 1);
+        else if (NOTED_KEYS.has(input.key)) control.note(taskId, `menekan ${input.key}`);
+        if (input.key === "Tab") this.typingField = undefined;
+        try {
+          await page.keyboard.down(input.key);
+        } catch {
+          // Karakter di luar tata letak papan ketik Playwright (mis. é): sisipkan sebagai teks.
+          if (printable) await page.keyboard.insertText(input.key);
+        }
+        return;
+      }
+      case "text":
+        await this.countTyping(page, taskId, [...input.text].length);
+        await page.keyboard.insertText(input.text);
+        return;
+    }
+  }
+
+  /** Hanya jumlah karakter yang dicatat, per field — isinya tidak pernah disimpan. */
+  private async countTyping(page: Page, taskId: string, characters: number): Promise<void> {
+    if (!this.typingField) {
+      const focused = await describeFocused(page);
+      this.typingField = `“${focused?.name ?? "halaman"}”`;
+    }
+    control.typed(taskId, this.typingField, characters);
+  }
+
+  /**
+   * Gambar viewport saat ini untuk agen, diperkecil ke `viewScale`. Lewat CDP karena Playwright
+   * tidak bisa memperkecil screenshot; clip memakai koordinat dokumen, jadi geser gulungan ikut dihitung.
+   */
+  async captureView(): Promise<{ data: string; width: number; height: number; scale: number; viewport: { width: number; height: number } }> {
+    const page = this.requirePage();
+    const viewport = page.viewportSize() ?? (await page.evaluate(() => ({ width: innerWidth, height: innerHeight })));
+    const scale = viewScale(viewport);
+    const own = this.cdp;
+    const client = own ?? (await page.context().newCDPSession(page));
+    try {
+      const metrics = (await client.send("Page.getLayoutMetrics")) as { cssVisualViewport?: { pageX: number; pageY: number } };
+      const shot = await client.send("Page.captureScreenshot", {
+        format: "jpeg",
+        quality: 80,
+        clip: {
+          x: metrics.cssVisualViewport?.pageX ?? 0,
+          y: metrics.cssVisualViewport?.pageY ?? 0,
+          width: viewport.width,
+          height: viewport.height,
+          scale,
+        },
+      });
+      return {
+        data: shot.data,
+        width: Math.round(viewport.width * scale),
+        height: Math.round(viewport.height * scale),
+        scale,
+        viewport,
+      };
+    } finally {
+      if (!own) await client.detach().catch(() => undefined);
+    }
+  }
 
   async getPage(viewport?: { width: number; height: number }): Promise<Page> {
     if (!this.browser) {
@@ -100,6 +322,7 @@ export class BrowserSession {
     } else if (viewport) {
       // Tanpa ini `open` kedua dengan ukuran lain diam-diam tetap memakai ukuran lama.
       await this.page.setViewportSize(viewport);
+      if (this.taskId) live.setState(this.taskId, { viewport });
     }
     return this.page;
   }
@@ -132,7 +355,7 @@ export class BrowserSession {
         if (frame === page.mainFrame()) live.setState(taskId, { url: frame.url() });
       });
       page.on("close", () => live.stop(taskId));
-      live.setState(taskId, { active: true, url: page.url() });
+      live.setState(taskId, { active: true, url: page.url(), viewport: page.viewportSize() ?? undefined });
       this.offDemand = live.onDemand(taskId, (watched) => (watched ? this.startCast(client) : this.stopCast(client)));
       if (live.viewerCount(taskId) > 0) this.startCast(client);
     } catch {
@@ -195,6 +418,8 @@ export class BrowserSession {
 
   async close(): Promise<void> {
     if (this.taskId) {
+      // Browser hilang: tool agen yang menunggu owner harus bangun, kendali tidak berarti lagi.
+      control.release(this.taskId, undefined, "browser ditutup");
       await this.captureFinalFrame(this.taskId);
       this.offDemand?.();
       this.offDemand = undefined;
@@ -249,14 +474,78 @@ export function createBrowserServer(session: BrowserSession, getTaskId: () => st
     throw new Error("butuh `selector` atau `text`");
   };
 
+  /** Tugas yang overlay Live-nya sedang ditonton; tanpa penonton aksi tidak diukur sama sekali. */
+  const watchedTask = (): string | undefined => {
+    const id = getTaskId();
+    return id && live.actionWatcherCount(id) > 0 ? id : undefined;
+  };
+
+  const announce = (action: Omit<BrowserAction, "at">): void => {
+    const id = watchedTask();
+    if (id) live.publishAction(id, { ...action, at: Date.now() });
+  };
+
+  /**
+   * Posisi & nama elemen target untuk overlay. Tidak pernah menggagalkan tool.
+   * `scrollFirst` hanya untuk aksi yang memang menggulung elemennya ke layar sendiri (click, hover,
+   * fill), jadi keadaan akhir halaman sama persis — ditonton atau tidak.
+   */
+  const probe = async (locator: Locator, scrollFirst: boolean): Promise<Target | undefined> => {
+    if (!watchedTask()) return undefined;
+    try {
+      if ((await locator.count()) === 0) return undefined;
+      if (scrollFirst) await locator.scrollIntoViewIfNeeded({ timeout: PROBE_TIMEOUT_MS });
+      return await locator.evaluate(describeElement, undefined, { timeout: PROBE_TIMEOUT_MS });
+    } catch {
+      return undefined;
+    }
+  };
+
+  const named = (target: Target | undefined, fallback: string): string => `“${target?.name || fallback}”`;
+
+  /**
+   * Setiap tool browser menunggu selama owner memegang kendali (tab Live → Ambil alih), lalu
+   * hasilnya diawali ringkasan apa yang owner lakukan. Tanpa owner, tool berjalan seperti biasa.
+   */
+  const gate = (definitions: Array<SdkMcpToolDefinition<any>>): Array<SdkMcpToolDefinition<any>> =>
+    definitions.map((definition) => ({
+      ...definition,
+      handler: async (args: unknown, extra: unknown) => {
+        const signal = (extra as { signal?: AbortSignal } | undefined)?.signal;
+        const wait = await control.waitIfHeld(getTaskId(), signal);
+        if (wait.kind === "held") return fail(wait.message);
+        const result = await definition.handler(args as never, extra);
+        if (wait.kind !== "returned") return result;
+        return { ...result, content: [{ type: "text" as const, text: wait.report }, ...result.content] };
+      },
+    }));
+
+  /** Koordinat gambar `view` → viewport (px CSS). Skalanya dihitung ulang dari viewport sekarang. */
+  const fromView = (page: Page, x: number, y: number): { x: number; y: number } => {
+    const viewport = page.viewportSize();
+    if (!viewport) throw new Error("ukuran viewport tidak diketahui — panggil open() dulu");
+    const scale = viewScale(viewport);
+    const point = { x: x / scale, y: y / scale };
+    if (point.x < 0 || point.y < 0 || point.x > viewport.width || point.y > viewport.height) {
+      throw new Error(
+        `(${x}, ${y}) di luar gambar ${Math.round(viewport.width * scale)}×${Math.round(viewport.height * scale)} — panggil view untuk melihat layar sekarang`,
+      );
+    }
+    return point;
+  };
+
+  const pointSchema = z.object({ x: z.number().min(0), y: z.number().min(0) });
+
   return createSdkMcpServer({
     name: "browser",
     version: "0.1.0",
     instructions:
       "Browser Chromium headless untuk pengujian QA dan audit UI/UX. Alur yang disarankan: open → snapshot → (click/fill/press/hover/select_option) → scroll/inspect → screenshot → console. Screenshot otomatis disimpan ke folder bukti laporan. " +
       "Sebelum melaporkan apa pun sebagai terpotong/tidak terlihat/hilang, panggil `inspect` — isi yang bisa di-scroll (scrollWidth > clientWidth dengan overflow auto|scroll) bukan teks terpotong, dan `scroll` bisa menggesernya. " +
-      "Dialog native confirm/alert/prompt dibatalkan otomatis kecuali Anda memasang `dialog` lebih dulu.",
-    tools: [
+      "Dialog native confirm/alert/prompt dibatalkan otomatis kecuali Anda memasang `dialog` lebih dulu. " +
+      "Untuk canvas, widget kustom, drag & drop, atau pemeriksaan visual ada tool berbasis layar: `view` lalu `click_at`/`type_text`/`scroll_at`/`drag`/`move` dengan koordinat gambar view. " +
+      "Kalau owner sedang memegang browser, tool menunggu sampai kendali dikembalikan.",
+    tools: gate([
       tool(
         "open",
         "Buka URL di browser dan kembalikan judul, status halaman, dan viewport. Isi `width` dan `height` berdua untuk mengganti ukuran viewport; ukuran itu bertahan sampai diganti lagi.",
@@ -270,6 +559,7 @@ export function createBrowserServer(session: BrowserSession, getTaskId: () => st
             const page = await session.getPage(
               args.width && args.height ? { width: args.width, height: args.height } : undefined,
             );
+            announce({ kind: "open", label: `Membuka ${args.url}` });
             const response = await page.goto(args.url, { waitUntil: "domcontentloaded", timeout: 30_000 });
             await page.waitForLoadState("networkidle", { timeout: 8_000 }).catch(() => undefined);
             const taskId = getTaskId();
@@ -289,6 +579,7 @@ export function createBrowserServer(session: BrowserSession, getTaskId: () => st
         async (args) => {
           try {
             const page = session.requirePage();
+            announce({ kind: "read", label: "Membaca struktur halaman" });
             const snapshot = await page.locator("body").ariaSnapshot();
             const max = args.maxChars ?? 12_000;
             return ok(
@@ -307,7 +598,10 @@ export function createBrowserServer(session: BrowserSession, getTaskId: () => st
           try {
             const page = session.requirePage();
             const before = session.dialogs.count();
-            await locate(page, args.selector, args.text).click({ timeout: 10_000 });
+            const element = locate(page, args.selector, args.text);
+            const target = await probe(element, true);
+            announce({ kind: "click", label: `Mengklik ${named(target, args.selector ?? args.text ?? "")}`, box: target?.box });
+            await element.click({ timeout: 10_000 });
             await page.waitForLoadState("domcontentloaded", { timeout: 8_000 }).catch(() => undefined);
             const dialogs = session.dialogs.takeSince(before);
             return ok(
@@ -329,7 +623,12 @@ export function createBrowserServer(session: BrowserSession, getTaskId: () => st
         async (args) => {
           try {
             const page = session.requirePage();
-            await page.locator(args.selector).first().fill(args.value, { timeout: 10_000 });
+            const element = page.locator(args.selector).first();
+            const target = await probe(element, true);
+            // Tanpa target (gagal diukur) isinya tidak ditampilkan: bisa saja itu field password.
+            const typed = target && !target.secret ? args.value.slice(0, 120) : target ? "••••••" : undefined;
+            announce({ kind: "fill", label: `Mengisi ${named(target, args.selector)}`, box: target?.box, text: typed });
+            await element.fill(args.value, { timeout: 10_000 });
             return ok(`Terisi: ${args.selector}`);
           } catch (error) {
             return fail(error instanceof Error ? error.message : String(error));
@@ -343,7 +642,10 @@ export function createBrowserServer(session: BrowserSession, getTaskId: () => st
         async (args) => {
           try {
             const page = session.requirePage();
-            if (args.selector) await page.locator(args.selector).first().press(args.key, { timeout: 10_000 });
+            const element = args.selector ? page.locator(args.selector).first() : undefined;
+            const target = element ? await probe(element, false) : undefined;
+            announce({ kind: "press", label: `Menekan ${args.key}`, key: args.key, box: target?.box });
+            if (element) await element.press(args.key, { timeout: 10_000 });
             else await page.keyboard.press(args.key);
             return ok(`Tombol ${args.key} ditekan`);
           } catch (error) {
@@ -385,6 +687,9 @@ export function createBrowserServer(session: BrowserSession, getTaskId: () => st
         async (args) => {
           try {
             const page = session.requirePage();
+            const target = args.selector ? await probe(page.locator(args.selector).first(), false) : undefined;
+            const where = args.selector ? named(target, args.selector) : "halaman";
+            announce({ kind: "scroll", label: `Menggulung ${where}`, box: target?.box });
             const report = await scroll(page, args);
             return ok(formatScroll(report));
           } catch (error) {
@@ -403,6 +708,8 @@ export function createBrowserServer(session: BrowserSession, getTaskId: () => st
         async (args) => {
           try {
             const page = session.requirePage();
+            const target = await probe(page.locator(args.selector).first(), false);
+            announce({ kind: "read", label: `Memeriksa ${named(target, args.selector)}`, box: target?.box });
             const reports = await inspect(page, args.selector, args.limit);
             return ok(formatInspect(reports, args.selector));
           } catch (error) {
@@ -420,6 +727,8 @@ export function createBrowserServer(session: BrowserSession, getTaskId: () => st
         async (args) => {
           try {
             const page = session.requirePage();
+            const target = await probe(page.locator(args.selector).first(), false);
+            announce({ kind: "read", label: `Membaca teks ${named(target, args.selector)}`, box: target?.box });
             const { texts, total } = await readText(page, args.selector, args.limit);
             const lines = texts.map((text, index) => `${index + 1}. ${text || "(kosong)"}`);
             return ok(
@@ -437,7 +746,10 @@ export function createBrowserServer(session: BrowserSession, getTaskId: () => st
         async (args) => {
           try {
             const page = session.requirePage();
-            await locate(page, args.selector, args.text).hover({ timeout: 10_000 });
+            const element = locate(page, args.selector, args.text);
+            const target = await probe(element, true);
+            announce({ kind: "hover", label: `Mengarahkan kursor ke ${named(target, args.selector ?? args.text ?? "")}`, box: target?.box });
+            await element.hover({ timeout: 10_000 });
             return ok(`Hover di: ${args.selector ?? args.text}`);
           } catch (error) {
             return fail(error instanceof Error ? error.message : String(error));
@@ -452,10 +764,14 @@ export function createBrowserServer(session: BrowserSession, getTaskId: () => st
           try {
             if (!args.value && !args.label) throw new Error("butuh `value` atau `label`");
             const page = session.requirePage();
-            const selected = await page
-              .locator(args.selector)
-              .first()
-              .selectOption(args.value ? { value: args.value } : { label: args.label as string }, { timeout: 10_000 });
+            const element = page.locator(args.selector).first();
+            const target = await probe(element, false);
+            announce({
+              kind: "select",
+              label: `Memilih “${args.label ?? args.value}” di ${named(target, args.selector)}`,
+              box: target?.box,
+            });
+            const selected = await element.selectOption(args.value ? { value: args.value } : { label: args.label as string }, { timeout: 10_000 });
             return ok(`Terpilih pada ${args.selector}: ${selected.join(", ") || "(tidak ada)"}`);
           } catch (error) {
             return fail(error instanceof Error ? error.message : String(error));
@@ -504,6 +820,7 @@ export function createBrowserServer(session: BrowserSession, getTaskId: () => st
             const page = session.requirePage();
             const safeName = args.name.replace(/[^a-zA-Z0-9-_]/g, "-").slice(0, 60) || "shot";
             const file = join(shotDir(), `${safeName}.png`);
+            announce({ kind: "shot", label: `Mengambil screenshot ${safeName}` });
             const buffer = await page.screenshot({ fullPage: args.fullPage ?? false, timeout: 20_000 });
             writeFileSync(file, buffer);
             return {
@@ -595,6 +912,16 @@ export function createBrowserServer(session: BrowserSession, getTaskId: () => st
             const page = session.requirePage();
             const paths = args.files.map(resolveUpload);
             const before = session.dialogs.count();
+            const element =
+              args.clickSelector || args.clickText
+                ? locate(page, args.clickSelector, args.clickText)
+                : page.locator(args.selector ?? 'input[type="file"]').first();
+            const probed = await probe(element, false);
+            announce({
+              kind: "upload",
+              label: paths.length === 0 ? "Mengosongkan pilihan berkas" : `Mengunggah ${args.files.join(", ")}`,
+              box: probed?.box,
+            });
             let target: string;
             if (args.clickSelector || args.clickText) {
               const [chooser] = await Promise.all([
@@ -632,10 +959,153 @@ export function createBrowserServer(session: BrowserSession, getTaskId: () => st
           }
         },
       ),
+      tool(
+        "view",
+        "Lihat layar browser SEKARANG sebagai gambar (bukan bukti laporan — pakai `screenshot` untuk bukti). " +
+          "Gambarnya diperkecil ke ukuran tetap; koordinat untuk click_at/type_text/scroll_at/drag/move memakai piksel gambar ini, (0,0) = kiri atas. " +
+          "Pakai untuk hal yang tidak bisa dijangkau selector: canvas, peta, grafik, widget kustom, drag & drop, atau memeriksa tampilan secara visual. " +
+          "Untuk form dan tombol biasa tetap utamakan snapshot + click/fill: lebih presisi dan lebih hemat.",
+        {},
+        async () => {
+          try {
+            const page = session.requirePage();
+            announce({ kind: "read", label: "Melihat layar" });
+            const shot = await session.captureView();
+            return {
+              content: [
+                {
+                  type: "text",
+                  text:
+                    `Layar ${shot.width}×${shot.height} px (viewport ${shot.viewport.width}×${shot.viewport.height}, skala ${shot.scale.toFixed(3)})\n` +
+                    `URL: ${page.url()}\nKoordinat untuk click_at/scroll_at/drag/move memakai piksel gambar ini.`,
+                },
+                { type: "image", data: shot.data, mimeType: "image/jpeg" },
+              ],
+            };
+          } catch (error) {
+            return fail(error instanceof Error ? error.message : String(error));
+          }
+        },
+      ),
+      tool(
+        "click_at",
+        "Klik di titik (x, y) pada gambar `view` terakhir. Panggil `view` dulu dan sesudah halaman berubah — titik dari gambar lama bisa sudah menunjuk elemen lain. " +
+          "Hasilnya menyebut elemen yang kena; kalau bukan yang dimaksud, lihat lagi dengan `view`.",
+        {
+          x: z.number().min(0).describe("piksel horizontal pada gambar view"),
+          y: z.number().min(0).describe("piksel vertikal pada gambar view"),
+          button: z.enum(["left", "right", "middle"]).optional().describe("bawaan left"),
+          double: z.boolean().optional().describe("klik ganda"),
+        },
+        async (args) => {
+          try {
+            const page = session.requirePage();
+            const point = fromView(page, args.x, args.y);
+            const target = await describeAt(page, point.x, point.y);
+            announce({ kind: "click", label: `Mengklik ${named(target, `titik (${args.x}, ${args.y})`)}`, point, box: target?.box });
+            const before = session.dialogs.count();
+            await page.mouse.click(point.x, point.y, { button: args.button ?? "left", clickCount: args.double ? 2 : 1 });
+            await page.waitForLoadState("domcontentloaded", { timeout: 8_000 }).catch(() => undefined);
+            const dialogs = session.dialogs.takeSince(before);
+            return ok(
+              `Diklik di (${args.x}, ${args.y}) → ${target ? `“${target.name}”` : "(tidak ada elemen)"}\nURL sekarang: ${page.url()}${
+                dialogs.length > 0 ? `\nDialog native yang muncul:\n${dialogs.join("\n")}` : ""
+              }`,
+            );
+          } catch (error) {
+            return fail(error instanceof Error ? error.message : String(error));
+          }
+        },
+      ),
+      tool(
+        "type_text",
+        "Ketik teks ke elemen yang sedang fokus (klik dulu field-nya dengan click_at atau click). Mengetik per karakter seperti manusia, jadi event keydown/input ikut terpicu. " +
+          "Untuk Enter/Tab/Escape pakai `press`.",
+        { text: z.string().max(5_000) },
+        async (args) => {
+          try {
+            const page = session.requirePage();
+            const focused = await describeFocused(page);
+            announce({
+              kind: "fill",
+              label: `Mengetik di ${named(focused, "halaman")}`,
+              box: focused?.box,
+              text: focused && !focused.secret ? args.text.slice(0, 120) : "••••••",
+            });
+            await page.keyboard.type(args.text);
+            return ok(`Diketik ${[...args.text].length} karakter ke ${named(focused, "elemen yang fokus")}`);
+          } catch (error) {
+            return fail(error instanceof Error ? error.message : String(error));
+          }
+        },
+      ),
+      tool(
+        "scroll_at",
+        "Gulung roda mouse di titik (x, y) pada gambar `view` — menggulung container yang ada di bawah titik itu. dx/dy dalam piksel gambar (dy positif = ke bawah).",
+        {
+          x: z.number().min(0),
+          y: z.number().min(0),
+          dx: z.number().optional(),
+          dy: z.number().optional(),
+        },
+        async (args) => {
+          try {
+            const page = session.requirePage();
+            const point = fromView(page, args.x, args.y);
+            const scale = viewScale(page.viewportSize()!);
+            const target = await describeAt(page, point.x, point.y);
+            announce({ kind: "scroll", label: `Menggulung ${named(target, "halaman")}`, point, box: target?.box });
+            await page.mouse.move(point.x, point.y);
+            await page.mouse.wheel((args.dx ?? 0) / scale, (args.dy ?? 0) / scale);
+            await page.waitForTimeout(250);
+            return ok(`Digulung di (${args.x}, ${args.y}) sebesar (${args.dx ?? 0}, ${args.dy ?? 0}) px gambar. Panggil view untuk melihat hasilnya.`);
+          } catch (error) {
+            return fail(error instanceof Error ? error.message : String(error));
+          }
+        },
+      ),
+      tool(
+        "drag",
+        "Seret dari satu titik ke titik lain pada gambar `view` (slider, drag & drop, menggambar di canvas).",
+        { from: pointSchema, to: pointSchema },
+        async (args) => {
+          try {
+            const page = session.requirePage();
+            const start = fromView(page, args.from.x, args.from.y);
+            const end = fromView(page, args.to.x, args.to.y);
+            const source = await describeAt(page, start.x, start.y);
+            announce({ kind: "click", label: `Menyeret ${named(source, "titik")} ke (${args.to.x}, ${args.to.y})`, point: end });
+            await page.mouse.move(start.x, start.y);
+            await page.mouse.down();
+            await page.mouse.move(end.x, end.y, { steps: 15 });
+            await page.mouse.up();
+            return ok(`Diseret dari (${args.from.x}, ${args.from.y}) → (${args.to.x}, ${args.to.y}). Panggil view untuk melihat hasilnya.`);
+          } catch (error) {
+            return fail(error instanceof Error ? error.message : String(error));
+          }
+        },
+      ),
+      tool(
+        "move",
+        "Pindahkan kursor ke titik (x, y) pada gambar `view` tanpa mengklik (tooltip, menu hover).",
+        { x: z.number().min(0), y: z.number().min(0) },
+        async (args) => {
+          try {
+            const page = session.requirePage();
+            const point = fromView(page, args.x, args.y);
+            const target = await describeAt(page, point.x, point.y);
+            announce({ kind: "hover", label: `Mengarahkan kursor ke ${named(target, "titik")}`, point, box: target?.box });
+            await page.mouse.move(point.x, point.y);
+            return ok(`Kursor di (${args.x}, ${args.y}) → ${target ? `“${target.name}”` : "(tidak ada elemen)"}`);
+          } catch (error) {
+            return fail(error instanceof Error ? error.message : String(error));
+          }
+        },
+      ),
       tool("close", "Tutup browser dan bebaskan resource.", {}, async () => {
         await session.close();
         return ok("Browser ditutup.");
       }),
-    ],
+    ]),
   });
 }
