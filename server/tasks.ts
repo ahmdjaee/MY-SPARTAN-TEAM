@@ -349,7 +349,9 @@ export function listDocs(id: string): DocInfo[] {
       // isFile() memakai lstat, jadi symlink tersaring di sini.
       if (!entry.isFile()) continue;
       if (!prefix && DOC_SKIP_NAMES.has(entry.name)) continue;
-      if (entry.name.endsWith(".tmp") || IMAGE_RE.test(entry.name)) continue;
+      // Gambar bukti sudah tampil di galeri Laporan. Gambar di downloads/ lain soal: itu hasil ekspor
+      // aplikasi yang diuji (QR, grafik PNG), dan satu-satunya tempat owner bisa melihatnya di sini.
+      if (entry.name.endsWith(".tmp") || (IMAGE_RE.test(entry.name) && prefix !== "downloads/")) continue;
       try {
         const stat = statSync(join(dir, entry.name));
         docs.push({ path: `${prefix}${entry.name}`, size: stat.size, mtime: stat.mtime.toISOString() });

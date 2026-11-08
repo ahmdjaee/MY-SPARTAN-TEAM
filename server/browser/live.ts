@@ -1,12 +1,58 @@
+export type Viewport = { width: number; height: number };
+
 export type LiveState = {
   active: boolean;
   url?: string;
   title?: string;
   lastFrameAt?: number;
+  /** Ukuran viewport halaman (px CSS) — UI memetakan koordinat aksi ke gambar Live dengan ini. */
+  viewport?: Viewport;
+  /** Owner sedang memegang kendali browser sejak waktu ini (ms epoch); agen menunggu. */
+  controlledSince?: number;
 };
 
 /** Yang dilihat UI: berubah hanya saat sesi mulai/berhenti, pindah halaman, atau frame pertama datang. */
-export type LiveView = { active: boolean; url?: string; title?: string; hasFrame: boolean };
+export type LiveView = {
+  active: boolean;
+  url?: string;
+  title?: string;
+  hasFrame: boolean;
+  viewport?: Viewport;
+  controlledSince?: number;
+};
+
+/** Kotak elemen dalam px CSS viewport (sama dengan getBoundingClientRect). */
+export type Box = { x: number; y: number; width: number; height: number };
+
+export type BrowserActionKind =
+  | "open"
+  | "click"
+  | "fill"
+  | "press"
+  | "hover"
+  | "select"
+  | "scroll"
+  | "upload"
+  | "shot"
+  | "read";
+
+/**
+ * Satu aksi agen di browser, untuk overlay tab Live (kursor, sorotan, keterangan).
+ * Hanya disiarkan ke penonton yang sedang membuka Live — tidak disimpan di thread.
+ */
+export type BrowserAction = {
+  kind: BrowserActionKind;
+  /** Keterangan untuk manusia, mis. "Mengklik tombol Masuk". */
+  label: string;
+  box?: Box;
+  /** Titik persis (tool berbasis koordinat); kursor overlay ke sini, bukan ke tengah kotak. */
+  point?: { x: number; y: number };
+  /** Isi yang diketik; field password selalu dimask sebelum sampai sini. */
+  text?: string;
+  /** Tombol keyboard untuk `press`. */
+  key?: string;
+  at: number;
+};
 
 /** Cukup `write` (+ `drain` bila ada) — di praktiknya ini objek Response milik Express. */
 export type Viewer = {
@@ -57,6 +103,7 @@ export class LiveHub {
   /** Kunci tampilan terakhir yang diumumkan; frame biasa (lastFrameAt) tidak memicu apa pun. */
   private readonly announced = new Map<string, string>();
   private readonly activeListeners = new Set<(taskId: string) => void>();
+  private readonly actionWatchers = new Map<string, Set<(action: BrowserAction) => void>>();
 
   constructor(options: { idleGraceMs?: number } = {}) {
     this.idleGraceMs = options.idleGraceMs ?? IDLE_GRACE_MS;
@@ -136,7 +183,43 @@ export class LiveHub {
 
   view(taskId: string): LiveView {
     const state = this.state(taskId);
-    return { active: state.active, url: state.url, title: state.title, hasFrame: this.frames.has(taskId) };
+    return {
+      active: state.active,
+      url: state.url,
+      title: state.title,
+      hasFrame: this.frames.has(taskId),
+      viewport: state.viewport,
+      controlledSince: state.controlledSince,
+    };
+  }
+
+  /** Penyimak aksi agen untuk overlay Live (topik WebSocket `live:<id>`). */
+  watchActions(taskId: string, listener: (action: BrowserAction) => void): () => void {
+    let set = this.actionWatchers.get(taskId);
+    if (!set) {
+      set = new Set();
+      this.actionWatchers.set(taskId, set);
+    }
+    set.add(listener);
+    return () => {
+      set.delete(listener);
+      if (set.size === 0 && this.actionWatchers.get(taskId) === set) this.actionWatchers.delete(taskId);
+    };
+  }
+
+  /** Ada yang menyimak overlay? Kalau tidak, tool browser tidak perlu mengukur posisi elemen. */
+  actionWatcherCount(taskId: string): number {
+    return this.actionWatchers.get(taskId)?.size ?? 0;
+  }
+
+  publishAction(taskId: string, action: BrowserAction): void {
+    for (const listener of this.actionWatchers.get(taskId) ?? []) {
+      try {
+        listener(action);
+      } catch {
+        // overlay hanya tambahan; tool browser tidak boleh ikut gagal
+      }
+    }
   }
 
   /** Perubahan tampilan live (bukan tiap frame) — dipakai WebSocket, pengganti polling /live/status. */
@@ -162,7 +245,8 @@ export class LiveHub {
   /** Dicatat walau belum ada penyimak: penyimak baru membandingkan dengan keadaan yang sebenarnya. */
   private announce(taskId: string): void {
     const view = this.view(taskId);
-    const key = `${view.active}|${view.hasFrame}|${view.url ?? ""}|${view.title ?? ""}`;
+    const size = view.viewport ? `${view.viewport.width}x${view.viewport.height}` : "";
+    const key = `${view.active}|${view.hasFrame}|${view.url ?? ""}|${view.title ?? ""}|${size}|${view.controlledSince ?? ""}`;
     const previous = this.announced.get(taskId);
     if (previous === key) return;
     this.announced.set(taskId, key);

@@ -1,5 +1,8 @@
 import { memo, useEffect, useRef, useState } from "react";
 import type { LiveState, StoredEvent } from "../api.ts";
+import { requestControl } from "../realtime.ts";
+import { LiveControl } from "./LiveControl.tsx";
+import { LiveOverlay } from "./LiveOverlay.tsx";
 
 /** Aksi browser terakhir dari thread — tidak perlu data tambahan dari server. */
 export function lastBrowserAction(events: StoredEvent[]): string | undefined {
@@ -49,6 +52,35 @@ export const LiveView = memo(function LiveView({
     wasConnected.current = connected;
   }, [connected]);
 
+  // Ambil alih: `mine` = tab ini yang memintanya. Kendali sungguhan dipegang server (per sambungan),
+  // jadi begitu server melaporkan tidak ada yang memegang, tanda lokal ikut padam.
+  const held = live.controlledSince !== undefined;
+  const [mine, setMine] = useState(false);
+  const [controlBusy, setControlBusy] = useState(false);
+  const [controlError, setControlError] = useState<string>();
+  const controlling = held && mine;
+  useEffect(() => {
+    if (!held) setMine(false);
+  }, [held]);
+  // Pindah tugas / tutup tab Live sambil memegang kendali: kembalikan ke agen, jangan biarkan ia menunggu.
+  const mineRef = useRef(false);
+  mineRef.current = controlling;
+  useEffect(
+    () => () => {
+      if (mineRef.current) void requestControl(taskId, "release");
+    },
+    [taskId],
+  );
+  const toggleControl = async () => {
+    setControlBusy(true);
+    setControlError(undefined);
+    const action = controlling ? "release" : "take";
+    const answer = await requestControl(taskId, action);
+    setControlBusy(false);
+    if (!answer.ok) setControlError(answer.error ?? "gagal");
+    else setMine(action === "take");
+  };
+
   // Chrome tidak selalu memutus aliran multipart saat <img> dilepas dari DOM; src kosong memaksanya.
   const image = useRef<HTMLImageElement>(null);
   useEffect(() => {
@@ -72,28 +104,69 @@ export const LiveView = memo(function LiveView({
         <span className="truncate font-mono text-muted" title={live.url}>
           {live.url ?? "—"}
         </span>
-        {showStream && (
-          <a
-            href={`/api/tasks/${encodeURIComponent(taskId)}/live`}
-            target="_blank"
-            rel="noreferrer"
-            className="ml-auto shrink-0 rounded-lg border border-line-strong px-2 py-1 text-ink hover:bg-hover"
-          >
-            Buka di tab baru
-          </a>
-        )}
+        <div className="ml-auto flex shrink-0 items-center gap-2">
+          {live.active && (
+            <button
+              type="button"
+              disabled={controlBusy}
+              onClick={() => void toggleControl()}
+              title={
+                controlling
+                  ? "Kembalikan browser ke bot; tool browser-nya lanjut dengan ringkasan apa yang Anda lakukan"
+                  : "Klik dan ketik sendiri di browser bot; tool browser bot menunggu sampai Anda menyerahkannya kembali"
+              }
+              className={`rounded-lg px-2 py-1 disabled:opacity-50 ${
+                controlling ? "bg-accent text-on-accent hover:bg-accent-hover" : "border border-line-strong text-ink hover:bg-hover"
+              }`}
+            >
+              {controlling ? "Serahkan ke bot" : "Ambil alih"}
+            </button>
+          )}
+          {showStream && (
+            <a
+              href={`/api/tasks/${encodeURIComponent(taskId)}/live`}
+              target="_blank"
+              rel="noreferrer"
+              className="rounded-lg border border-line-strong px-2 py-1 text-ink hover:bg-hover"
+            >
+              Buka di tab baru
+            </a>
+          )}
+        </div>
       </div>
 
-      <div className="mt-3 min-h-0 flex-1 overflow-hidden rounded-xl border border-line bg-sunken">
+      {(held || controlError) && (
+        <p
+          className={`mt-2 rounded-lg px-3 py-1.5 text-xs ${
+            controlError ? "bg-tag-red text-tag-red-ink" : "bg-tag-yellow text-tag-yellow-ink"
+          }`}
+        >
+          {controlError
+            ? `Tidak bisa mengubah kendali: ${controlError}`
+            : controlling
+              ? "Anda memegang kendali. Klik, gulung, dan ketik langsung di gambar; tool browser bot menunggu. Isi ketikan Anda tidak dikirim ke bot — hanya jumlah karakternya."
+              : "Kendali browser sedang dipegang di tab lain; tool browser bot menunggu. Tekan Ambil alih untuk memindahkannya ke sini."}
+        </p>
+      )}
+
+      <div className="relative mt-3 min-h-0 flex-1 overflow-hidden rounded-xl border border-line bg-sunken">
         {showStream ? (
           connected && (
-            <img
-              ref={image}
-              key={streamKey}
-              src={`/api/tasks/${encodeURIComponent(taskId)}/live?t=${streamKey}`}
-              alt="Tampilan browser bot secara langsung"
-              className="h-full w-full object-contain"
-            />
+            <>
+              <img
+                ref={image}
+                key={streamKey}
+                src={`/api/tasks/${encodeURIComponent(taskId)}/live?t=${streamKey}`}
+                alt="Tampilan browser bot secara langsung"
+                className="h-full w-full object-contain"
+              />
+              {live.active &&
+                (controlling && live.viewport ? (
+                  <LiveControl taskId={taskId} viewport={live.viewport} />
+                ) : (
+                  <LiveOverlay taskId={taskId} viewport={live.viewport} />
+                ))}
+            </>
           )
         ) : (
           <div className="grid h-full place-items-center px-6 text-center text-sm text-faint">

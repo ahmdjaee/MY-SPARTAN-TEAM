@@ -2,7 +2,9 @@
  * Satu WebSocket per tab browser, pengganti SSE dan polling.
  *
  * Klien → server:  {op:"sub", sid, topic, after?} · {op:"unsub", sid}
+ *                  {op:"control", task, action:"take"|"release"} · {op:"input", task, input}
  * Server → klien:  {sid, event} · {sid, op:"ready"} · {sid, error} · {op:"hb"}
+ *                  {op:"control", task, ok, error?}
  *
  * `sid` dipilih klien per langganan, jadi dua komponen boleh menyimak topik yang sama dengan
  * `after` berbeda. `ready` dikirim setelah langganan terpasang (dan replay selesai): klien yang
@@ -13,7 +15,9 @@
  * - `task:<id>`     status & permintaan terbuka, `live`, replay setelah `after`, event bus, `task_changed`
  * - `ask:<id>`      `snapshot` panel Tanya, lalu delta/answer/busy/error
  * - `project:<id>`  `project_changed` (temuan/kurator) dan `project_tasks_changed`
+ * - `live:<id>`     `browser_action` — aksi agen untuk overlay tab Live (hanya selama tab itu terbuka)
  */
+import { randomUUID } from "node:crypto";
 import type { IncomingMessage, Server } from "node:http";
 import type { Duplex } from "node:stream";
 import { WebSocket, WebSocketServer, type RawData } from "ws";
@@ -21,7 +25,9 @@ import { z } from "zod";
 import { ASK_MODELS, askHub } from "./agent/ask.ts";
 import { bus } from "./agent/bus.ts";
 import { scheduler } from "./agent/scheduler.ts";
+import { control } from "./browser/control.ts";
 import { live } from "./browser/live.ts";
+import { browserActiveFor, ownerInput } from "./browser/mcp.ts";
 import { onProjectChanged } from "./changes.ts";
 import { rejectReason } from "./http-guard.ts";
 import { getProject } from "./projects.ts";
@@ -43,15 +49,46 @@ const HARD_BUFFER = 16 * 1024 * 1024;
 const REPLAY_MAX = 1_000;
 
 const ID = "[A-Za-z0-9_-]{1,64}";
-const TOPIC = new RegExp(`^(global|task:${ID}|ask:${ID}|project:${ID})$`);
+const TOPIC = new RegExp(`^(global|task:${ID}|ask:${ID}|project:${ID}|live:${ID})$`);
 const Sid = z.number().int().min(1).max(1e9);
+const TaskId = z.string().regex(new RegExp(`^${ID}$`));
+/** Koordinat viewport dari UI; dijepit lagi ke ukuran viewport di sisi browser. */
+const Coord = z.number().finite().min(-100_000).max(100_000);
+const Button = z.enum(["left", "right", "middle"]);
+const Clicks = z.number().int().min(1).max(3);
+const Delta = z.number().finite().min(-10_000).max(10_000);
+const OwnerInputSchema = z.discriminatedUnion("t", [
+  z.object({ t: z.literal("move"), x: Coord, y: Coord }),
+  z.object({ t: z.literal("down"), x: Coord, y: Coord, button: Button, clicks: Clicks }),
+  z.object({ t: z.literal("up"), x: Coord, y: Coord, button: Button, clicks: Clicks }),
+  z.object({ t: z.literal("wheel"), x: Coord, y: Coord, dx: Delta, dy: Delta }),
+  z.object({
+    t: z.literal("key"),
+    phase: z.enum(["down", "up"]),
+    key: z.string().min(1).max(32),
+    ctrl: z.boolean().optional(),
+    meta: z.boolean().optional(),
+  }),
+  z.object({ t: z.literal("text"), text: z.string().min(1).max(5_000) }),
+]);
 const ClientMessage = z.discriminatedUnion("op", [
   z.object({ op: z.literal("sub"), sid: Sid, topic: z.string().regex(TOPIC), after: z.number().int().min(0).optional() }),
   z.object({ op: z.literal("unsub"), sid: Sid }),
+  z.object({ op: z.literal("control"), task: TaskId, action: z.enum(["take", "release"]) }),
+  z.object({ op: z.literal("input"), task: TaskId, input: OwnerInputSchema }),
 ]);
+/** Batas input owner per sambungan per detik — mouse 60 Hz + ketikan cepat jauh di bawah ini. */
+const MAX_INPUT_PER_SECOND = 400;
 
 type Emit = (event: unknown, droppable?: boolean) => void;
-type Client = { ws: WebSocket; subs: Map<number, () => void>; alive: boolean };
+type Client = {
+  id: string;
+  ws: WebSocket;
+  subs: Map<number, () => void>;
+  alive: boolean;
+  inputWindow: number;
+  inputCount: number;
+};
 
 function send(client: Client, message: unknown, droppable = false): void {
   const { ws } = client;
@@ -152,6 +189,12 @@ function projectTopic(projectId: string, emit: Emit): (() => void) | string {
   };
 }
 
+/** Aksi agen di browser untuk overlay Live. Boleh dibuang saat klien lambat — itu hanya animasi. */
+function liveTopic(taskId: string, emit: Emit): (() => void) | string {
+  if (!getTask(taskId)) return "tugas tidak ditemukan";
+  return live.watchActions(taskId, (action) => emit({ type: "browser_action", ...action }, true));
+}
+
 function openTopic(topic: string, after: number | undefined, emit: Emit): (() => void) | string {
   const colon = topic.indexOf(":");
   const kind = colon < 0 ? topic : topic.slice(0, colon);
@@ -160,6 +203,7 @@ function openTopic(topic: string, after: number | undefined, emit: Emit): (() =>
   if (kind === "task") return taskTopic(id, after, emit);
   if (kind === "ask") return askTopic(id, emit);
   if (kind === "project") return projectTopic(id, emit);
+  if (kind === "live") return liveTopic(id, emit);
   return "topik tidak dikenal";
 }
 
@@ -179,6 +223,14 @@ function onMessage(client: Client, raw: RawData, isBinary: boolean): void {
   }
   if (!parsed.success) return;
   const message = parsed.data;
+  if (message.op === "control") {
+    onControl(client, message.task, message.action);
+    return;
+  }
+  if (message.op === "input") {
+    onInput(client, message.task, message.input);
+    return;
+  }
   const previous = client.subs.get(message.sid);
   if (previous) {
     client.subs.delete(message.sid);
@@ -206,6 +258,34 @@ function onMessage(client: Client, raw: RawData, isBinary: boolean): void {
   send(client, { sid, op: "ready" });
 }
 
+/** Ambil alih / serahkan browser tugas. Hanya untuk tugas yang browsernya sedang hidup. */
+function onControl(client: Client, taskId: string, action: "take" | "release"): void {
+  const answer = (error?: string) => send(client, { op: "control", task: taskId, ok: !error, ...(error ? { error } : {}) });
+  if (action === "release") {
+    control.release(taskId, client.id);
+    answer();
+    return;
+  }
+  if (!getTask(taskId)) return answer("tugas tidak ditemukan");
+  if (!browserActiveFor(taskId)) return answer("browser bot sedang tidak berjalan");
+  control.take(taskId, client.id);
+  answer();
+}
+
+/** Input owner hanya diteruskan dari sambungan yang memegang kendali tugas itu. */
+function onInput(client: Client, taskId: string, input: z.infer<typeof OwnerInputSchema>): void {
+  if (control.holderOf(taskId) !== client.id) return;
+  const now = Date.now();
+  if (now - client.inputWindow >= 1_000) {
+    client.inputWindow = now;
+    client.inputCount = 0;
+  }
+  client.inputCount += 1;
+  // Gerakan mouse boleh dibuang; tombol & ketikan tidak, supaya tidak ada key yang "nyangkut".
+  if (client.inputCount > MAX_INPUT_PER_SECOND && input.t === "move") return;
+  ownerInput(taskId, input);
+}
+
 function reject(socket: Duplex, status: string): void {
   socket.write(`HTTP/1.1 ${status}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`);
   socket.destroy();
@@ -229,7 +309,7 @@ export function attachRealtime(server: Server): Realtime {
       return;
     }
     wss.handleUpgrade(req, socket, head, (ws) => {
-      const client: Client = { ws, subs: new Map(), alive: true };
+      const client: Client = { id: randomUUID(), ws, subs: new Map(), alive: true, inputWindow: 0, inputCount: 0 };
       clients.add(client);
       ws.on("pong", () => {
         client.alive = true;
@@ -237,6 +317,8 @@ export function attachRealtime(server: Server): Realtime {
       ws.on("message", (raw, isBinary) => onMessage(client, raw, isBinary));
       ws.on("close", () => {
         clients.delete(client);
+        // Tab yang memegang kendali tertutup/terputus: browser kembali ke agen, agen tidak menunggu sia-sia.
+        control.releaseHolder(client.id);
         for (const off of client.subs.values()) off();
         client.subs.clear();
       });

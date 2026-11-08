@@ -78,7 +78,27 @@ export type RoleInfo = {
 export type Slots = { inUse: number; max: number; runners: number; workspaceBusy: boolean };
 
 /** Keadaan tab Live; didorong server (event `live` di WebSocket) dan ikut di detail tugas. */
-export type LiveState = { active: boolean; url?: string; title?: string; hasFrame?: boolean };
+export type LiveState = {
+  active: boolean;
+  url?: string;
+  title?: string;
+  hasFrame?: boolean;
+  /** Ukuran viewport halaman bot (px CSS), untuk memetakan koordinat ke gambar Live. */
+  viewport?: { width: number; height: number };
+  /** Owner memegang kendali browser sejak (ms epoch); agen menunggu. */
+  controlledSince?: number;
+};
+
+/** Aksi bot di browser untuk overlay Live (topik `live:<id>`); lihat server/browser/live.ts. */
+export type BrowserAction = {
+  kind: "open" | "click" | "fill" | "press" | "hover" | "select" | "scroll" | "upload" | "shot" | "read";
+  label: string;
+  box?: { x: number; y: number; width: number; height: number };
+  point?: { x: number; y: number };
+  text?: string;
+  key?: string;
+  at: number;
+};
 
 export type TaskListItem = TaskSummary & { live?: boolean };
 
