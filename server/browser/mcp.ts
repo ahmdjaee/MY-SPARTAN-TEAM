@@ -1,15 +1,43 @@
 import { existsSync, mkdirSync, unlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { createSdkMcpServer, tool, type SdkMcpToolDefinition } from "@anthropic-ai/claude-agent-sdk";
 import { chromium, type Browser, type CDPSession, type Locator, type Page } from "playwright";
 import { z } from "zod";
 import { CONFIG } from "../config.ts";
 import { bus } from "../agent/bus.ts";
-import { assetsDir, getTask } from "../tasks.ts";
+import { assetsDir, getTask, taskDir } from "../tasks.ts";
 import { control, type OwnerInput } from "./control.ts";
+import { describeDownload, DownloadTracker } from "./downloads.ts";
 import { live, type Box, type BrowserAction } from "./live.ts";
 import { KINDS, kindFromName, makeTestFile, type TestFileKind } from "./files.ts";
 import { DialogWatcher, formatInspect, formatScroll, inspect, readText, scroll } from "./ops.ts";
+import {
+  clip,
+  diffSnapshots,
+  focusedElement,
+  formatChanges,
+  formatSettle,
+  isHeavy,
+  NetworkTracker,
+  pageOverview,
+  PopupTracker,
+  refName,
+  scrollInfo,
+  sharedRefCount,
+  SETTLE_FULL,
+  SETTLE_HOVER,
+  SETTLE_LIGHT,
+  SETTLE_OPEN,
+  SETTLE_SUGGEST,
+  secretSnapshot,
+  takeSnapshot,
+  within,
+  type SettleOptions,
+  type SettleResult,
+  type Snapshot,
+} from "./outcome.ts";
+import { cleanRef, failureText, resolveTarget, TargetError, targetLabel, type TargetArgs } from "./targets.ts";
 
 type CallResult = Awaited<ReturnType<Parameters<typeof tool>[3]>>;
 
@@ -37,9 +65,16 @@ function describeElement(el: Element): Target {
   const input = el instanceof HTMLInputElement ? el : null;
   const field = input !== null || el instanceof HTMLTextAreaElement || el instanceof HTMLSelectElement;
   const labelled = (el as HTMLInputElement).labels?.[0];
+  // Teks <label> tanpa kontrol di dalamnya: label yang membungkus <select> ikut memuat semua teks
+  // opsinya ("Kota Bandung Jakarta"), dan yang membungkus <textarea> memuat isinya.
+  const labelText = (label: HTMLLabelElement): string => {
+    const copy = label.cloneNode(true) as HTMLElement;
+    for (const control of copy.querySelectorAll("input, select, textarea, button")) control.remove();
+    return clean(copy.textContent);
+  };
   const name =
     clean(el.getAttribute("aria-label")) ||
-    (labelled ? clean(labelled.innerText) : "") ||
+    (labelled ? labelText(labelled) : "") ||
     clean(el.getAttribute("placeholder")) ||
     (field ? "" : clean((el as HTMLElement).innerText)) ||
     clean(el.getAttribute("name")) ||
@@ -50,6 +85,60 @@ function describeElement(el: Element): Target {
     name: name.slice(0, 60),
     secret: input?.type === "password",
   };
+}
+
+type FieldState = { value: string; secret: boolean; rich: boolean; suggest: boolean };
+
+/** Dijalankan DI halaman: isi field setelah `fill`, untuk dibandingkan dengan yang dikirim. */
+function readField(el: Element): FieldState {
+  const field = el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement || el instanceof HTMLSelectElement;
+  const autocomplete = el.getAttribute("aria-autocomplete") ?? "";
+  return {
+    value: field ? (el as HTMLInputElement).value : ((el as HTMLElement).innerText ?? ""),
+    secret: el instanceof HTMLInputElement && el.type === "password",
+    rich: !field,
+    suggest: el.getAttribute("role") === "combobox" || el.hasAttribute("list") || autocomplete === "list" || autocomplete === "both",
+  };
+}
+
+/**
+ * Catatan kalau isi field berbeda dari yang diisi — maxlength, mask, atau format otomatis diam-diam
+ * mengubahnya, dan itu sering justru yang sedang diuji. Isi field password tidak pernah ditulis.
+ */
+function fillNote(sent: string, field: FieldState | undefined): string | undefined {
+  if (!field) return undefined;
+  const length = (text: string) => [...text].length;
+  const squash = (text: string) => text.replace(/\s+/g, " ").trim();
+  const same = field.rich ? squash(field.value) === squash(sent) : field.value === sent;
+  const notes: string[] = [];
+  if (!same) {
+    notes.push(
+      field.secret
+        ? `Catatan: isi field sekarang ${length(field.value)} karakter, bukan ${length(sent)} yang diisi — ada maxlength atau format?`
+        : `Catatan: nilai field sekarang ${JSON.stringify(clip(field.value, 120))} (${length(field.value)} karakter), bukan yang diisi (${length(sent)} karakter) — maxlength, mask, atau format otomatis?`,
+    );
+  }
+  if (field.suggest) notes.push("Field ini autocomplete/combobox: pilih sarannya dari daftar perubahan di bawah dengan click ref — jangan menekan Enter.");
+  return notes.length > 0 ? notes.join("\n") : undefined;
+}
+
+type Special = { kind: "select" | "file"; options: string[] };
+
+/** Dijalankan DI halaman: elemen yang tidak dipakai lewat klik biasa. */
+function specialElement(el: Element): Special | undefined {
+  if (el instanceof HTMLSelectElement) {
+    return { kind: "select", options: Array.from(el.options).slice(0, 20).map((option) => option.label || option.value) };
+  }
+  if (el instanceof HTMLInputElement && el.type === "file") return { kind: "file", options: [] };
+  return undefined;
+}
+
+function clickNote(special: Special | undefined): string | undefined {
+  if (special?.kind === "select") {
+    return `Catatan: ini <select> native — daftar opsinya tidak tampil di browser headless. Pakai select_option; opsinya: ${special.options.join(" | ") || "(kosong)"}`;
+  }
+  if (special?.kind === "file") return "Catatan: ini input berkas — pakai upload (berkas uji dibuat dengan make_file).";
+  return undefined;
 }
 
 /** Sesi browser yang sedang hidup, supaya bisa ditutup dari luar saat tugas berakhir. */
@@ -138,15 +227,10 @@ const SCREENCAST = {
 const FINAL_FRAME_TIMEOUT_MS = 2_000;
 /** Halaman yang memuntahkan error terus-menerus tidak boleh menumbuhkan memori tanpa batas. */
 const MAX_LOGS = 500;
+/** Batas aksi setelah sasarannya sudah ditemukan dan terlihat. */
+const ACTION_TIMEOUT_MS = 5_000;
 
-/** `undefined` kalau `promise` tidak selesai dalam `ms`. */
-function within<T>(promise: Promise<T>, ms: number): Promise<T | undefined> {
-  let timer: NodeJS.Timeout | undefined;
-  const timeout = new Promise<undefined>((resolve) => {
-    timer = setTimeout(() => resolve(undefined), ms);
-  });
-  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
-}
+const sameDocument = (a: string, b: string): boolean => a.split("#")[0] === b.split("#")[0];
 
 /** Tutup browser milik satu tugas (dipanggil runner saat tugas ditutup/dioper/dibatalkan). */
 export async function closeBrowserFor(taskId: string): Promise<void> {
@@ -168,6 +252,12 @@ export class BrowserSession {
   /** Log lama yang dibuang karena melewati MAX_LOGS sejak drain terakhir. */
   private droppedLogs = 0;
   readonly dialogs = new DialogWatcher();
+  readonly downloads = new DownloadTracker(() => this.downloadDir());
+  readonly popups = new PopupTracker();
+  /** Request jaringan halaman sekarang, untuk menunggu halaman tenang setelah aksi. */
+  private network?: NetworkTracker;
+  /** Halaman yang snapshot-nya terlalu berat untuk diambil di setiap aksi; ringkasan perubahannya dimatikan. */
+  private heavyUrl?: string;
   /** Input owner dijalankan berurutan; gerakan mouse yang menumpuk dibuang. */
   private inputChain: Promise<void> = Promise.resolve();
   private queuedMoves = 0;
@@ -317,6 +407,11 @@ export class BrowserSession {
         if (response.status() >= 400) this.log(`[http ${response.status()}] ${response.url()}`);
       });
       this.dialogs.attach(page);
+      this.network = new NetworkTracker();
+      this.network.attach(page);
+      this.downloads.attach(page);
+      this.popups.attach(page);
+      this.heavyUrl = undefined;
       this.page = page;
       await this.startLive(page);
     } else if (viewport) {
@@ -416,6 +511,102 @@ export class BrowserSession {
     return logs;
   }
 
+  /** Unduhan tugas tinggal di `<folder tugas>/downloads/`, yang otomatis tampil di tab Lampiran. */
+  /** Folder unduhan tugas (tampil di tab Lampiran); tanpa tugas, folder sementara di luar data/. */
+  private downloadDir(): string {
+    const id = this.getTaskId();
+    return id ? join(taskDir(id), "downloads") : join(tmpdir(), "ai-team-downloads");
+  }
+
+  async settle(page: Page, options: SettleOptions, since?: number): Promise<SettleResult> {
+    return this.network ? this.network.settle(page, options, since) : { ms: 0, settled: true, pending: [] };
+  }
+
+  /** Ringkasan isi halaman (heading, jumlah elemen) — sekaligus mencatat halaman yang terlalu berat. */
+  async overview(page: Page): Promise<string | undefined> {
+    const snapshot = await takeSnapshot(page);
+    if (!snapshot) return undefined;
+    if (isHeavy(snapshot)) this.heavyUrl = page.url();
+    return pageOverview(snapshot.text);
+  }
+
+  /**
+   * Jalankan satu aksi lalu susun laporannya: dialog native, unduhan, tab baru, dan perubahan halaman
+   * setelah halaman tenang. `run` menerima snapshot sebelum aksi, untuk menamai ref yang dituju.
+   */
+  async act<T>(
+    page: Page,
+    run: (before: Snapshot | undefined) => Promise<T>,
+    options: { settle?: SettleOptions | ((value: T) => SettleOptions); focus?: boolean } = {},
+  ): Promise<{ value: T; report: string[] }> {
+    const marks = { dialogs: this.dialogs.count(), downloads: this.downloads.count(), popups: this.popups.count() };
+    const startUrl = page.url();
+    const before = this.heavyUrl === startUrl ? undefined : await takeSnapshot(page);
+    if (before && isHeavy(before)) this.heavyUrl = startUrl;
+    const began = Date.now();
+    const value = await run(before);
+    const settle = typeof options.settle === "function" ? options.settle(value) : options.settle;
+    const settled = await this.settle(page, settle ?? SETTLE_FULL, began);
+    const [downloads, popups] = await Promise.all([this.downloads.since(marks.downloads), this.popups.since(marks.popups)]);
+    const dialogs = this.dialogs.takeSince(marks.dialogs);
+
+    const report: string[] = [];
+    if (dialogs.length > 0) {
+      report.push(`Dialog native yang muncul:\n${dialogs.join("\n")}\n(pakai tool \`dialog\` sebelum aksi kalau ingin menekan OK)`);
+    }
+    report.push(...downloads.map(describeDownload));
+    const downloaded = new Set(downloads.map((download) => download.url));
+    for (const popup of popups) {
+      if (!popup.url || popup.url === "about:blank" || downloaded.has(popup.url)) continue;
+      report.push(
+        `Tab baru dibuka: ${popup.title ? `“${clip(popup.title, 80)}” — ` : ""}${popup.url}. Tool hanya bekerja di tab utama, ` +
+          "jadi tab itu sudah ditutup; buka URL-nya dengan open bila perlu diuji.",
+      );
+    }
+    const { text, after } = await this.describeChanges(page, before, startUrl, settled);
+    // Fokus hanya berarti di dokumen yang sama; setelah submit yang pindah halaman, itu cuma noise.
+    const sameDoc = after !== undefined && (!before || sharedRefCount(before.text, after.text) > 0);
+    const focus = options.focus && sameDoc ? focusedElement(after.text) : undefined;
+    if (focus) report.push(focus);
+    report.push(text);
+    return { value, report };
+  }
+
+  private async describeChanges(
+    page: Page,
+    before: Snapshot | undefined,
+    startUrl: string,
+    settled: SettleResult,
+  ): Promise<{ text: string; after?: Snapshot }> {
+    const calm = formatSettle(settled);
+    if (page.isClosed()) return { text: `Halaman ${calm}.` };
+    const url = page.url();
+    const moved = !sameDocument(url, startUrl);
+    if (this.heavyUrl === url && !moved) {
+      return {
+        text: `Halaman ${calm}. Ringkasan perubahan dilewati: halaman ini terlalu besar untuk dipotret di setiap aksi — pakai snapshot dengan selector.`,
+      };
+    }
+    const after = await takeSnapshot(page);
+    if (!after) return { text: `Halaman ${calm}.` };
+    if (isHeavy(after)) this.heavyUrl = url;
+    return { text: await this.changesText(page, before, after, url, moved, calm), after };
+  }
+
+  private async changesText(page: Page, before: Snapshot | undefined, after: Snapshot, url: string, moved: boolean, calm: string): Promise<string> {
+    const arrived = async (how: string) =>
+      `${how} (${calm}): “${clip(await page.title().catch(() => ""), 80)}” — ${url}\n${pageOverview(after.text)}`;
+    if (!before) return moved ? arrived("Pindah halaman") : `Halaman ${calm}.`;
+    // Dokumen baru (navigasi penuh, submit form, muat ulang): tidak ada elemen yang sama, jadi
+    // ringkasan halaman lebih berguna daripada "semua hilang, semua muncul".
+    if (sharedRefCount(before.text, after.text) === 0) return arrived(moved ? "Pindah halaman" : "Halaman dimuat ulang");
+    const changes = diffSnapshots(before.text, after.text);
+    if (changes.length === 0) return moved ? arrived("Pindah halaman") : `Tidak ada perubahan di halaman (${calm}).`;
+    const { text, omitted } = formatChanges(changes);
+    if (moved && omitted > 0) return arrived("Pindah halaman");
+    return `${moved ? `URL berubah ke ${url}. ` : ""}Perubahan halaman (${calm}; + muncul, ~ berubah, − hilang — ref-nya langsung bisa dipakai):\n${text}`;
+  }
+
   async close(): Promise<void> {
     if (this.taskId) {
       // Browser hilang: tool agen yang menunggu owner harus bangun, kendali tidak berarti lagi.
@@ -468,10 +659,28 @@ export function createBrowserServer(session: BrowserSession, getTaskId: () => st
     return target;
   };
 
-  const locate = (page: Page, selector?: string, text?: string) => {
-    if (selector) return page.locator(selector).first();
-    if (text) return page.getByText(text, { exact: false }).first();
-    throw new Error("butuh `selector` atau `text`");
+  /** Cari sasaran aksi. Kalau gagal, aksinya tetap disiarkan ke overlay Live (tanpa kotak) sebelum tool gagal. */
+  const aim = async (page: Page, args: TargetArgs, failed: Omit<BrowserAction, "at">): Promise<Locator> => {
+    try {
+      return await resolveTarget(page, args);
+    } catch (error) {
+      announce(failed);
+      throw error;
+    }
+  };
+
+  /** Nama sasaran sebelum ditemukan: dari snapshot untuk ref, selain itu selector/teksnya. */
+  const hintOf = (args: TargetArgs, before: Snapshot | undefined): string =>
+    (args.ref ? refName(before?.text, cleanRef(args.ref)) : undefined) ?? targetLabel(args);
+
+  /** Nama sasaran di hasil tool, supaya agen bisa memastikan yang kena memang yang dimaksud. */
+  const nameOf = async (element: Locator, args: TargetArgs, before: Snapshot | undefined, probed: Target | undefined): Promise<string> => {
+    const ref = args.ref ? cleanRef(args.ref) : undefined;
+    const known = ref ? refName(before?.text, ref) : undefined;
+    if (ref && known) return `${known} [${ref}]`;
+    const hit = probed ?? (await element.evaluate(describeElement).catch(() => undefined));
+    if (ref) return `“${hit?.name ?? "?"}” [${ref}]`;
+    return hit ? `“${hit.name}” (${targetLabel(args)})` : targetLabel(args);
   };
 
   /** Tugas yang overlay Live-nya sedang ditonton; tanpa penonton aksi tidak diukur sama sekali. */
@@ -540,7 +749,9 @@ export function createBrowserServer(session: BrowserSession, getTaskId: () => st
     name: "browser",
     version: "0.1.0",
     instructions:
-      "Browser Chromium headless untuk pengujian QA dan audit UI/UX. Alur yang disarankan: open → snapshot → (click/fill/press/hover/select_option) → scroll/inspect → screenshot → console. Screenshot otomatis disimpan ke folder bukti laporan. " +
+      "Browser Chromium headless untuk pengujian QA dan audit UI/UX. Alur yang disarankan: open → snapshot → (click/fill/press/hover/select_option dengan `ref` dari snapshot) → scroll/inspect → screenshot → console. Screenshot otomatis disimpan ke folder bukti laporan. " +
+      "Hasil setiap aksi sudah menunggu halaman tenang dan mencantumkan perubahan halaman (+ muncul, ~ berubah, − hilang, lengkap dengan ref barunya), dialog, unduhan, dan tab baru — tidak perlu `wait` jeda tetap atau screenshot hanya untuk melihat hasil aksi. " +
+      "Unduhan (tombol Ekspor, URL ekspor) tersimpan di ./downloads/ dan dilaporkan isinya. " +
       "Sebelum melaporkan apa pun sebagai terpotong/tidak terlihat/hilang, panggil `inspect` — isi yang bisa di-scroll (scrollWidth > clientWidth dengan overflow auto|scroll) bukan teks terpotong, dan `scroll` bisa menggesernya. " +
       "Dialog native confirm/alert/prompt dibatalkan otomatis kecuali Anda memasang `dialog` lebih dulu. " +
       "Untuk canvas, widget kustom, drag & drop, atau pemeriksaan visual ada tool berbasis layar: `view` lalu `click_at`/`type_text`/`scroll_at`/`drag`/`move` dengan koordinat gambar view. " +
@@ -548,7 +759,8 @@ export function createBrowserServer(session: BrowserSession, getTaskId: () => st
     tools: gate([
       tool(
         "open",
-        "Buka URL di browser dan kembalikan judul, status halaman, dan viewport. Isi `width` dan `height` berdua untuk mengganti ukuran viewport; ukuran itu bertahan sampai diganti lagi.",
+        "Buka URL di browser dan kembalikan judul, status halaman, viewport, dan ringkasan isinya (heading, jumlah tautan/tombol/field). Tool menunggu sampai halaman tenang (data SPA ikut termuat) — tidak perlu wait sesudahnya. " +
+          "URL yang langsung mengunduh berkas (ekspor) dilaporkan sebagai unduhan di ./downloads/. Isi `width` dan `height` berdua untuk mengganti ukuran viewport; ukuran itu bertahan sampai diganti lagi.",
         {
           url: z.string().describe("URL lengkap termasuk http/https"),
           width: z.number().int().min(320).max(3840).optional(),
@@ -560,103 +772,180 @@ export function createBrowserServer(session: BrowserSession, getTaskId: () => st
               args.width && args.height ? { width: args.width, height: args.height } : undefined,
             );
             announce({ kind: "open", label: `Membuka ${args.url}` });
-            const response = await page.goto(args.url, { waitUntil: "domcontentloaded", timeout: 30_000 });
-            await page.waitForLoadState("networkidle", { timeout: 8_000 }).catch(() => undefined);
+            const downloadsBefore = session.downloads.count();
+            const began = Date.now();
+            let response: Awaited<ReturnType<Page["goto"]>> = null;
+            try {
+              response = await page.goto(args.url, { waitUntil: "domcontentloaded", timeout: 30_000 });
+            } catch (error) {
+              if (!/Download is starting/i.test(error instanceof Error ? error.message : String(error))) throw error;
+              await session.downloads.started(downloadsBefore, 5_000);
+              const downloads = await session.downloads.since(downloadsBefore);
+              return ok(
+                [`URL ini langsung mengunduh berkas, bukan membuka halaman. Browser tetap di ${page.url() || "halaman kosong"}.`, ...downloads.map(describeDownload)].join("\n"),
+              );
+            }
+            const settled = await session.settle(page, SETTLE_OPEN, began);
+            const overview = await session.overview(page);
+            const downloads = await session.downloads.since(downloadsBefore);
+            const title = await page.title();
             const taskId = getTaskId();
-            if (taskId) live.setState(taskId, { url: page.url(), title: await page.title() });
+            if (taskId) live.setState(taskId, { url: page.url(), title });
             return ok(
-              `Terbuka: ${page.url()}\nStatus HTTP: ${response?.status() ?? "(tidak ada respons)"}\nJudul: ${await page.title()}\nViewport: ${viewportLabel(page)}`,
+              [
+                `Terbuka: ${page.url()}`,
+                `Status HTTP: ${response?.status() ?? "(tidak ada respons)"}`,
+                `Judul: ${title}`,
+                `Viewport: ${viewportLabel(page)}`,
+                `Halaman ${formatSettle(settled)}.`,
+                ...(overview ? [overview] : []),
+                ...downloads.map(describeDownload),
+              ].join("\n"),
             );
           } catch (error) {
-            return fail(error instanceof Error ? error.message : String(error));
+            return fail(failureText(error));
           }
         },
       ),
       tool(
         "snapshot",
-        "Ambil struktur accessibility halaman (elemen & teks yang bisa diklik). Pakai ini sebelum click/fill agar selector yang dipakai benar-benar ada.",
-        { maxChars: z.number().int().min(500).max(40_000).optional() },
+        "Struktur halaman untuk beraksi: setiap elemen punya [ref=…] (mis. e12 atau f2e7) — pakai ref itu di click/fill/hover/press/select_option. Lebih tepat daripada selector atau teks: tombol kembar di baris tabel pun jelas mana yang dituju. " +
+          "Elemen tersembunyi tidak tercantum; [cursor=pointer] menandai elemen kustom yang bisa diklik. Ref tetap berlaku selama elemennya masih ada. " +
+          "`selector` membatasi ke satu bagian (form, tabel, .modal) — hemat untuk halaman besar. Isi field password disamarkan.",
+        {
+          selector: z.string().optional().describe("batasi ke bagian ini, mis. form, table, .modal"),
+          maxChars: z.number().int().min(500).max(40_000).optional(),
+        },
         async (args) => {
           try {
             const page = session.requirePage();
             announce({ kind: "read", label: "Membaca struktur halaman" });
-            const snapshot = await page.locator("body").ariaSnapshot();
+            const { text: snapshot } = await secretSnapshot(page, args.selector ? page.locator(args.selector).first() : page, 10_000);
             const max = args.maxChars ?? 12_000;
+            const position = await scrollInfo(page);
             return ok(
-              `URL: ${page.url()}\nJudul: ${await page.title()}\n\n${snapshot.length > max ? `${snapshot.slice(0, max)}\n… (dipotong)` : snapshot}`,
+              [
+                `URL: ${page.url()}`,
+                `Judul: ${await page.title()}`,
+                ...(position ? [`Posisi: ${position}`] : []),
+                ...(args.selector ? [`Bagian: ${args.selector}`] : []),
+                "",
+                snapshot.length > max
+                  ? `${snapshot.slice(0, max)}\n… (dipotong — pakai selector untuk membatasi ke bagian yang dibutuhkan)`
+                  : snapshot,
+              ].join("\n"),
             );
           } catch (error) {
-            return fail(error instanceof Error ? error.message : String(error));
+            return fail(failureText(error));
           }
         },
       ),
       tool(
         "click",
-        "Klik elemen berdasarkan CSS selector atau teks yang terlihat.",
-        { selector: z.string().optional(), text: z.string().optional() },
+        "Klik elemen. Pakai `ref` dari snapshot (paling tepat), atau `selector`/`text` — keduanya hanya mengenai elemen yang TERLIHAT. " +
+          "Hasilnya sudah menunggu halaman tenang dan mencantumkan perubahan halaman beserta ref barunya, dialog, unduhan, dan tab baru.",
+        {
+          ref: z.string().optional().describe("ref dari snapshot, mis. e12"),
+          selector: z.string().optional(),
+          text: z.string().optional().describe("teks yang terlihat, cocok sebagian"),
+        },
         async (args) => {
           try {
             const page = session.requirePage();
-            const before = session.dialogs.count();
-            const element = locate(page, args.selector, args.text);
-            const target = await probe(element, true);
-            announce({ kind: "click", label: `Mengklik ${named(target, args.selector ?? args.text ?? "")}`, box: target?.box });
-            await element.click({ timeout: 10_000 });
-            await page.waitForLoadState("domcontentloaded", { timeout: 8_000 }).catch(() => undefined);
-            const dialogs = session.dialogs.takeSince(before);
-            return ok(
-              `Diklik: ${args.selector ?? args.text}\nURL sekarang: ${page.url()}${
-                dialogs.length > 0
-                  ? `\nDialog native yang muncul:\n${dialogs.join("\n")}\n(pakai tool \`dialog\` sebelum click kalau ingin menekan OK)`
-                  : ""
-              }`,
-            );
+            const { value, report } = await session.act(page, async (before) => {
+              const hint = hintOf(args, before);
+              const element = await aim(page, args, { kind: "click", label: `Mengklik “${hint}”` });
+              const target = await probe(element, true);
+              announce({ kind: "click", label: `Mengklik ${named(target, hint)}`, box: target?.box });
+              const name = await nameOf(element, args, before, target);
+              const special = await element.evaluate(specialElement).catch(() => undefined);
+              await element.click({ timeout: ACTION_TIMEOUT_MS });
+              return { name, note: clickNote(special) };
+            });
+            return ok([`Diklik: ${value.name}`, ...(value.note ? [value.note] : []), `URL sekarang: ${page.url()}`, ...report].join("\n"));
           } catch (error) {
-            return fail(error instanceof Error ? error.message : String(error));
+            return fail(failureText(error));
           }
         },
       ),
       tool(
         "fill",
-        "Isi input/textarea dengan nilai tertentu.",
-        { selector: z.string(), value: z.string() },
+        "Isi input/textarea/contenteditable (isi lama diganti). Pakai `ref` dari snapshot atau `selector`. " +
+          "Isi field dibaca ulang: kalau berbeda dari yang diisi (maxlength, mask, format otomatis) hasilnya memberi tahu. Pesan validasi atau saran autocomplete yang muncul tercantum di perubahan halaman.",
+        {
+          ref: z.string().optional().describe("ref dari snapshot, mis. e12"),
+          selector: z.string().optional(),
+          value: z.string(),
+        },
         async (args) => {
           try {
+            if (!args.ref && !args.selector) return fail("butuh `ref` (dari snapshot) atau `selector`");
             const page = session.requirePage();
-            const element = page.locator(args.selector).first();
-            const target = await probe(element, true);
-            // Tanpa target (gagal diukur) isinya tidak ditampilkan: bisa saja itu field password.
-            const typed = target && !target.secret ? args.value.slice(0, 120) : target ? "••••••" : undefined;
-            announce({ kind: "fill", label: `Mengisi ${named(target, args.selector)}`, box: target?.box, text: typed });
-            await element.fill(args.value, { timeout: 10_000 });
-            return ok(`Terisi: ${args.selector}`);
+            const where: TargetArgs = { ref: args.ref, selector: args.selector };
+            const { value, report } = await session.act(
+              page,
+              async (before) => {
+                const hint = hintOf(where, before);
+                const element = await aim(page, where, { kind: "fill", label: `Mengisi “${hint}”` });
+                const target = await probe(element, true);
+                // Tanpa target (gagal diukur) isinya tidak ditampilkan: bisa saja itu field password.
+                const typed = target && !target.secret ? args.value.slice(0, 120) : target ? "••••••" : undefined;
+                announce({ kind: "fill", label: `Mengisi ${named(target, hint)}`, box: target?.box, text: typed });
+                const name = await nameOf(element, where, before, target);
+                await element.fill(args.value, { timeout: ACTION_TIMEOUT_MS });
+                const field = await element.evaluate(readField).catch(() => undefined);
+                return { name, note: fillNote(args.value, field), suggest: field?.suggest === true };
+              },
+              { settle: (filled) => (filled.suggest ? SETTLE_SUGGEST : SETTLE_LIGHT) },
+            );
+            return ok([`Terisi: ${value.name}`, ...(value.note ? [value.note] : []), ...report].join("\n"));
           } catch (error) {
-            return fail(error instanceof Error ? error.message : String(error));
+            return fail(failureText(error));
           }
         },
       ),
       tool(
         "press",
-        "Tekan tombol keyboard (contoh: Enter, Tab, Escape).",
-        { key: z.string(), selector: z.string().optional() },
+        "Tekan tombol keyboard (contoh: Enter, Tab, Escape, Control+A) — di elemen yang sedang fokus, atau di `ref`/`selector`. Hasilnya menyebut elemen yang fokus sesudahnya (untuk audit urutan Tab) dan perubahan halaman seperti click.",
+        {
+          key: z.string(),
+          ref: z.string().optional().describe("ref dari snapshot, mis. e12"),
+          selector: z.string().optional(),
+        },
         async (args) => {
           try {
             const page = session.requirePage();
-            const element = args.selector ? page.locator(args.selector).first() : undefined;
-            const target = element ? await probe(element, false) : undefined;
-            announce({ kind: "press", label: `Menekan ${args.key}`, key: args.key, box: target?.box });
-            if (element) await element.press(args.key, { timeout: 10_000 });
-            else await page.keyboard.press(args.key);
-            return ok(`Tombol ${args.key} ditekan`);
+            const where: TargetArgs = { ref: args.ref, selector: args.selector };
+            const { value, report } = await session.act(
+              page,
+              async (before) => {
+                if (!where.ref && !where.selector) {
+                  announce({ kind: "press", label: `Menekan ${args.key}`, key: args.key });
+                  await page.keyboard.press(args.key);
+                  return undefined;
+                }
+                const hint = hintOf(where, before);
+                const element = await aim(page, where, { kind: "press", label: `Menekan ${args.key}`, key: args.key });
+                const target = await probe(element, false);
+                announce({ kind: "press", label: `Menekan ${args.key}`, key: args.key, box: target?.box });
+                const name = await nameOf(element, where, before, target);
+                await element.press(args.key, { timeout: ACTION_TIMEOUT_MS });
+                return name;
+              },
+              { focus: true },
+            );
+            return ok([`Tombol ${args.key} ditekan${value ? ` di ${value}` : ""}`, `URL sekarang: ${page.url()}`, ...report].join("\n"));
           } catch (error) {
-            return fail(error instanceof Error ? error.message : String(error));
+            return fail(failureText(error));
           }
         },
       ),
       tool(
         "wait",
-        "Tunggu selector muncul/hilang, atau tunggu sejumlah milidetik.",
+        "Tunggu teks atau selector muncul/hilang, atau tunggu sejumlah milidetik. Aksi sudah menunggu halaman tenang sendiri — pakai ini hanya untuk hal yang datang belakangan (toast, proses panjang). " +
+          "`text` menunggu teks itu TERLIHAT (atau hilang dengan state hidden).",
         {
+          text: z.string().optional().describe("teks yang ditunggu, cocok sebagian"),
           selector: z.string().optional(),
           state: z.enum(["attached", "detached", "visible", "hidden"]).optional(),
           ms: z.number().int().min(100).max(30_000).optional(),
@@ -664,6 +953,12 @@ export function createBrowserServer(session: BrowserSession, getTaskId: () => st
         async (args) => {
           try {
             const page = session.requirePage();
+            if (args.text) {
+              const shown = page.getByText(args.text, { exact: false }).visible().first();
+              const gone = args.state === "hidden" || args.state === "detached";
+              await shown.waitFor({ state: gone ? "detached" : "attached", timeout: 15_000 });
+              return ok(`Teks "${args.text}" sudah ${gone ? "tidak terlihat" : "terlihat"}`);
+            }
             if (args.selector) {
               await page.locator(args.selector).first().waitFor({ state: args.state ?? "visible", timeout: 15_000 });
               return ok(`Selector ${args.selector} sudah ${args.state ?? "visible"}`);
@@ -741,40 +1036,79 @@ export function createBrowserServer(session: BrowserSession, getTaskId: () => st
       ),
       tool(
         "hover",
-        "Taruh kursor di atas elemen (untuk tooltip, menu, atau tombol yang baru muncul saat di-hover).",
-        { selector: z.string().optional(), text: z.string().optional() },
+        "Taruh kursor di atas elemen (untuk tooltip, menu, atau tombol yang baru muncul saat di-hover). Pakai `ref` dari snapshot, atau `selector`/`text`. Isi yang muncul tercantum di perubahan halaman, lengkap dengan ref-nya.",
+        {
+          ref: z.string().optional().describe("ref dari snapshot, mis. e12"),
+          selector: z.string().optional(),
+          text: z.string().optional(),
+        },
         async (args) => {
           try {
             const page = session.requirePage();
-            const element = locate(page, args.selector, args.text);
-            const target = await probe(element, true);
-            announce({ kind: "hover", label: `Mengarahkan kursor ke ${named(target, args.selector ?? args.text ?? "")}`, box: target?.box });
-            await element.hover({ timeout: 10_000 });
-            return ok(`Hover di: ${args.selector ?? args.text}`);
+            const { value, report } = await session.act(
+              page,
+              async (before) => {
+                const hint = hintOf(args, before);
+                const element = await aim(page, args, { kind: "hover", label: `Mengarahkan kursor ke “${hint}”` });
+                const target = await probe(element, true);
+                announce({ kind: "hover", label: `Mengarahkan kursor ke ${named(target, hint)}`, box: target?.box });
+                const name = await nameOf(element, args, before, target);
+                await element.hover({ timeout: ACTION_TIMEOUT_MS });
+                return name;
+              },
+              { settle: SETTLE_HOVER },
+            );
+            return ok([`Hover di: ${value}`, ...report].join("\n"));
           } catch (error) {
-            return fail(error instanceof Error ? error.message : String(error));
+            return fail(failureText(error));
           }
         },
       ),
       tool(
         "select_option",
-        "Pilih opsi pada elemen <select> berdasarkan value atau label yang terlihat.",
-        { selector: z.string(), value: z.string().optional(), label: z.string().optional() },
+        "Pilih opsi pada <select> native berdasarkan value atau label yang terlihat. Pakai `ref` dari snapshot (combobox) atau `selector`. " +
+          "Opsi yang tidak ada dilaporkan beserta daftar opsi yang tersedia. Dropdown kustom (bukan <select>): click untuk membukanya, lalu click opsinya.",
+        {
+          ref: z.string().optional().describe("ref dari snapshot, mis. e12"),
+          selector: z.string().optional(),
+          value: z.string().optional(),
+          label: z.string().optional(),
+        },
         async (args) => {
           try {
-            if (!args.value && !args.label) throw new Error("butuh `value` atau `label`");
+            if (!args.value && !args.label) return fail("butuh `value` atau `label`");
+            if (!args.ref && !args.selector) return fail("butuh `ref` (dari snapshot) atau `selector`");
             const page = session.requirePage();
-            const element = page.locator(args.selector).first();
-            const target = await probe(element, false);
-            announce({
-              kind: "select",
-              label: `Memilih “${args.label ?? args.value}” di ${named(target, args.selector)}`,
-              box: target?.box,
+            const where: TargetArgs = { ref: args.ref, selector: args.selector };
+            const choice = args.label ?? args.value ?? "";
+            const { value, report } = await session.act(page, async (before) => {
+              const hint = hintOf(where, before);
+              const element = await aim(page, where, { kind: "select", label: `Memilih “${choice}” di “${hint}”` });
+              const target = await probe(element, false);
+              announce({ kind: "select", label: `Memilih “${choice}” di ${named(target, hint)}`, box: target?.box });
+              const name = await nameOf(element, where, before, target);
+              try {
+                const selected = await element.selectOption(args.value ? { value: args.value } : { label: args.label as string }, {
+                  timeout: ACTION_TIMEOUT_MS,
+                });
+                return { name, selected };
+              } catch (error) {
+                if (!/did not find some options/.test(error instanceof Error ? error.message : String(error))) throw error;
+                const options = await element
+                  .evaluate((el) =>
+                    el instanceof HTMLSelectElement
+                      ? Array.from(el.options)
+                          .slice(0, 40)
+                          .map((option) => (option.label === option.value ? option.label : `${option.label} (value=${option.value})`))
+                      : [],
+                  )
+                  .catch(() => [] as string[]);
+                throw new TargetError(`opsi ${JSON.stringify(choice)} tidak ada di ${name}. Opsi yang tersedia: ${options.join(" | ") || "(kosong)"}`);
+              }
             });
-            const selected = await element.selectOption(args.value ? { value: args.value } : { label: args.label as string }, { timeout: 10_000 });
-            return ok(`Terpilih pada ${args.selector}: ${selected.join(", ") || "(tidak ada)"}`);
+            return ok([`Terpilih pada ${value.name}: ${value.selected.join(", ") || "(tidak ada)"}`, ...report].join("\n"));
           } catch (error) {
-            return fail(error instanceof Error ? error.message : String(error));
+            return fail(failureText(error));
           }
         },
       ),
@@ -900,10 +1234,12 @@ export function createBrowserServer(session: BrowserSession, getTaskId: () => st
       tool(
         "upload",
         "Serahkan berkas dari ./uploads/ (buat dulu dengan make_file) ke input file halaman. Beri `selector` <input type=file> (boleh tersembunyi), " +
-          "ATAU `clickSelector`/`clickText` tombol kustom yang membuka dialog pilih berkas. Tanpa keduanya dipakai input file pertama di halaman. `files: []` mengosongkan pilihan.",
+          "ATAU `clickRef`/`clickSelector`/`clickText` tombol kustom yang membuka dialog pilih berkas. Tanpa keduanya dipakai input file pertama di halaman. `files: []` mengosongkan pilihan. " +
+          "Hasilnya menunggu unggahan yang langsung berjalan dan mencantumkan perubahan halaman (nama berkas, pratinjau, pesan galat).",
         {
           files: z.array(z.string()).max(20).describe("nama berkas di ./uploads/"),
           selector: z.string().optional(),
+          clickRef: z.string().optional().describe("ref tombol unggah dari snapshot"),
           clickSelector: z.string().optional(),
           clickText: z.string().optional(),
         },
@@ -911,51 +1247,46 @@ export function createBrowserServer(session: BrowserSession, getTaskId: () => st
           try {
             const page = session.requirePage();
             const paths = args.files.map(resolveUpload);
-            const before = session.dialogs.count();
-            const element =
-              args.clickSelector || args.clickText
-                ? locate(page, args.clickSelector, args.clickText)
+            const button: TargetArgs = { ref: args.clickRef, selector: args.clickSelector, text: args.clickText };
+            const clicking = Boolean(button.ref || button.selector || button.text);
+            const label = paths.length === 0 ? "Mengosongkan pilihan berkas" : `Mengunggah ${args.files.join(", ")}`;
+            const { value: target, report } = await session.act(page, async (before) => {
+              const element = clicking
+                ? await aim(page, button, { kind: "upload", label })
                 : page.locator(args.selector ?? 'input[type="file"]').first();
-            const probed = await probe(element, false);
-            announce({
-              kind: "upload",
-              label: paths.length === 0 ? "Mengosongkan pilihan berkas" : `Mengunggah ${args.files.join(", ")}`,
-              box: probed?.box,
-            });
-            let target: string;
-            if (args.clickSelector || args.clickText) {
-              const [chooser] = await Promise.all([
-                page.waitForEvent("filechooser", { timeout: 10_000 }),
-                locate(page, args.clickSelector, args.clickText).click({ timeout: 10_000 }),
-              ]);
-              if (paths.length > 1 && !chooser.isMultiple()) {
-                return fail("input ini hanya menerima satu berkas (tanpa atribut multiple) — kirim satu nama saja");
+              const probed = await probe(element, false);
+              announce({ kind: "upload", label, box: probed?.box });
+              if (clicking) {
+                const [chooser] = await Promise.all([
+                  page.waitForEvent("filechooser", { timeout: 10_000 }),
+                  element.click({ timeout: 10_000 }),
+                ]);
+                if (paths.length > 1 && !chooser.isMultiple()) {
+                  throw new TargetError("input ini hanya menerima satu berkas (tanpa atribut multiple) — kirim satu nama saja");
+                }
+                await chooser.setFiles(paths);
+                return `dialog pilih berkas dari ${await nameOf(element, button, before, probed)}`;
               }
-              await chooser.setFiles(paths);
-              target = `dialog pilih berkas dari ${args.clickSelector ?? args.clickText}`;
-            } else {
               const selector = args.selector ?? 'input[type="file"]';
-              const input = page.locator(selector).first();
-              if ((await input.count()) === 0) {
-                return fail(
+              if ((await element.count()) === 0) {
+                throw new TargetError(
                   args.selector
                     ? `tidak ada elemen ${selector}`
-                    : "tidak ada <input type=file> di halaman — pakai clickSelector/clickText pada tombol unggahnya",
+                    : "tidak ada <input type=file> di halaman — pakai clickRef/clickSelector/clickText pada tombol unggahnya",
                 );
               }
-              await input.setInputFiles(paths, { timeout: 10_000 });
-              target = selector;
-            }
-            // Banyak form langsung mengunggah begitu berkas dipilih; beri waktu requestnya jalan.
-            await page.waitForLoadState("networkidle", { timeout: 3_000 }).catch(() => undefined);
-            const dialogs = session.dialogs.takeSince(before);
+              await element.setInputFiles(paths, { timeout: 10_000 });
+              return selector;
+            });
             return ok(
-              `${paths.length === 0 ? "Pilihan berkas dikosongkan" : `Terunggah ke ${target}: ${args.files.join(", ")}`}\nURL sekarang: ${page.url()}${
-                dialogs.length > 0 ? `\nDialog native yang muncul:\n${dialogs.join("\n")}` : ""
-              }`,
+              [
+                paths.length === 0 ? "Pilihan berkas dikosongkan" : `Terunggah ke ${target}: ${args.files.join(", ")}`,
+                `URL sekarang: ${page.url()}`,
+                ...report,
+              ].join("\n"),
             );
           } catch (error) {
-            return fail(error instanceof Error ? error.message : String(error));
+            return fail(failureText(error));
           }
         },
       ),
@@ -1001,19 +1332,17 @@ export function createBrowserServer(session: BrowserSession, getTaskId: () => st
           try {
             const page = session.requirePage();
             const point = fromView(page, args.x, args.y);
-            const target = await describeAt(page, point.x, point.y);
-            announce({ kind: "click", label: `Mengklik ${named(target, `titik (${args.x}, ${args.y})`)}`, point, box: target?.box });
-            const before = session.dialogs.count();
-            await page.mouse.click(point.x, point.y, { button: args.button ?? "left", clickCount: args.double ? 2 : 1 });
-            await page.waitForLoadState("domcontentloaded", { timeout: 8_000 }).catch(() => undefined);
-            const dialogs = session.dialogs.takeSince(before);
+            const { value: target, report } = await session.act(page, async () => {
+              const target = await describeAt(page, point.x, point.y);
+              announce({ kind: "click", label: `Mengklik ${named(target, `titik (${args.x}, ${args.y})`)}`, point, box: target?.box });
+              await page.mouse.click(point.x, point.y, { button: args.button ?? "left", clickCount: args.double ? 2 : 1 });
+              return target;
+            });
             return ok(
-              `Diklik di (${args.x}, ${args.y}) → ${target ? `“${target.name}”` : "(tidak ada elemen)"}\nURL sekarang: ${page.url()}${
-                dialogs.length > 0 ? `\nDialog native yang muncul:\n${dialogs.join("\n")}` : ""
-              }`,
+              [`Diklik di (${args.x}, ${args.y}) → ${target ? `“${target.name}”` : "(tidak ada elemen)"}`, `URL sekarang: ${page.url()}`, ...report].join("\n"),
             );
           } catch (error) {
-            return fail(error instanceof Error ? error.message : String(error));
+            return fail(failureText(error));
           }
         },
       ),
@@ -1025,17 +1354,31 @@ export function createBrowserServer(session: BrowserSession, getTaskId: () => st
         async (args) => {
           try {
             const page = session.requirePage();
-            const focused = await describeFocused(page);
-            announce({
-              kind: "fill",
-              label: `Mengetik di ${named(focused, "halaman")}`,
-              box: focused?.box,
-              text: focused && !focused.secret ? args.text.slice(0, 120) : "••••••",
-            });
-            await page.keyboard.type(args.text);
-            return ok(`Diketik ${[...args.text].length} karakter ke ${named(focused, "elemen yang fokus")}`);
+            const { value: typed, report } = await session.act(
+              page,
+              async () => {
+                const focused = await describeFocused(page);
+                announce({
+                  kind: "fill",
+                  label: `Mengetik di ${named(focused, "halaman")}`,
+                  box: focused?.box,
+                  text: focused && !focused.secret ? args.text.slice(0, 120) : "••••••",
+                });
+                await page.keyboard.type(args.text);
+                const suggest = await page
+                  .evaluate(() => {
+                    const el = document.activeElement;
+                    const autocomplete = el?.getAttribute("aria-autocomplete") ?? "";
+                    return Boolean(el && (el.getAttribute("role") === "combobox" || el.hasAttribute("list") || autocomplete === "list" || autocomplete === "both"));
+                  })
+                  .catch(() => false);
+                return { focused, suggest };
+              },
+              { settle: (typed) => (typed.suggest ? SETTLE_SUGGEST : SETTLE_LIGHT) },
+            );
+            return ok([`Diketik ${[...args.text].length} karakter ke ${named(typed.focused, "elemen yang fokus")}`, ...report].join("\n"));
           } catch (error) {
-            return fail(error instanceof Error ? error.message : String(error));
+            return fail(failureText(error));
           }
         },
       ),
@@ -1073,15 +1416,19 @@ export function createBrowserServer(session: BrowserSession, getTaskId: () => st
             const page = session.requirePage();
             const start = fromView(page, args.from.x, args.from.y);
             const end = fromView(page, args.to.x, args.to.y);
-            const source = await describeAt(page, start.x, start.y);
-            announce({ kind: "click", label: `Menyeret ${named(source, "titik")} ke (${args.to.x}, ${args.to.y})`, point: end });
-            await page.mouse.move(start.x, start.y);
-            await page.mouse.down();
-            await page.mouse.move(end.x, end.y, { steps: 15 });
-            await page.mouse.up();
-            return ok(`Diseret dari (${args.from.x}, ${args.from.y}) → (${args.to.x}, ${args.to.y}). Panggil view untuk melihat hasilnya.`);
+            const { report } = await session.act(page, async () => {
+              const source = await describeAt(page, start.x, start.y);
+              announce({ kind: "click", label: `Menyeret ${named(source, "titik")} ke (${args.to.x}, ${args.to.y})`, point: end });
+              await page.mouse.move(start.x, start.y);
+              await page.mouse.down();
+              await page.mouse.move(end.x, end.y, { steps: 15 });
+              await page.mouse.up();
+            });
+            return ok(
+              [`Diseret dari (${args.from.x}, ${args.from.y}) → (${args.to.x}, ${args.to.y}). Panggil view untuk melihat posisinya.`, ...report].join("\n"),
+            );
           } catch (error) {
-            return fail(error instanceof Error ? error.message : String(error));
+            return fail(failureText(error));
           }
         },
       ),

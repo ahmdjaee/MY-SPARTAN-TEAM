@@ -88,7 +88,7 @@ otomatis saat start berikutnya. Kalau ingin hidup sejak boot tanpa login: `login
 4. Setelah selesai, status jadi **perlu dibaca**. Buka tab **Laporan** (QA, UI/UX) atau **Perubahan** (kode), lalu **Review**: *Setuju* menutup tugas; *Perlu perbaikan* mengirim komentar Anda ke bot yang sama dan tugas kembali dikerjakan.
    - Tab **Laporan** punya tiga bagian. **Report utama** menampilkan verdict terkini dan `report.md` per putaran (laporan awal, perbaikan, uji ulang), yang terbaru di atas, plus galeri bukti. **Temuan** berisi temuan terbuka per severity beserta detail dari laporan; temuan yang belum dikurasi berlabel *belum masuk register*. **Resolved** berisi temuan yang sudah ditangani: *menunggu uji ulang*, *terverifikasi*, *diperbaiki*, *tidak diperbaiki*, atau *bukan masalah*. Isinya memuat ulang sendiri, dan tombol **Download temuan** mengunduh temuan tugas itu.
    - Status temuan berubah saat bot melapor: Engineer/DevOps lewat `finding_report_fixed` (pindah ke Resolved, menunggu uji ulang), QA lewat `finding_retest` (lolos jadi terverifikasi; gagal kembali ke Temuan dengan tanda regresi). Hanya QA yang bisa memverifikasi. UI/UX melaporkan temuan lewat `report.md` dan tidak mengubah statusnya.
-   - Berkas teks lain yang ditulis agen ke folder tugas — laporan tambahan `.md`, bukti data `.tsv`/`.txt`, patch, skrip uji, berkas uji unggahan di `uploads/` — tampil di tab **Lampiran**: daftar berkas di kiri, isinya dirender di kanan (`.md` sebagai markdown, sisanya apa adanya), dengan tombol **Unduh** per berkas. Tidak perlu lagi membuka `data/tasks/` dari terminal.
+   - Berkas lain di folder tugas — laporan tambahan `.md`, bukti data `.tsv`/`.txt`, patch, skrip uji, berkas uji unggahan di `uploads/`, dan hasil ekspor yang diunduh bot saat menguji di `downloads/` — tampil di tab **Lampiran**: daftar berkas di kiri, isinya dirender di kanan (`.md` sebagai markdown, teks lain apa adanya, berkas biner seperti xlsx/pdf cukup dengan tombolnya), dengan tombol **Unduh** per berkas. Tidak perlu lagi membuka `data/tasks/` dari terminal.
 5. Tab **Kerja** hanya ikut turun kalau Anda memang sedang berada di dasar. Begitu Anda scroll ke atas untuk membaca chat lama, tampilan diam walau agen terus menulis; yang muncul cuma tombol **Pesan baru ↓** (berubah kuning jadi **Menunggu keputusan Anda ↓** kalau ada kartu persetujuan). Kembali ke dasar — lewat tombol itu atau scroll sendiri — membuatnya mengikuti lagi.
 6. **Oper ke…** memindahkan tugas ke bot lain. Bot baru menerima instruksi asli, **ringkasan serah terima** bot sebelumnya, catatan operan Anda, dan daftar bukti yang sudah ada. Riwayatnya tampil sebagai `QA → Engineer → QA`.
 7. Bot bisa **mengusulkan** operan sendiri (`suggest_handoff`); usulan muncul sebagai tombol satu-klik, tidak pernah jalan tanpa Anda.
@@ -148,6 +148,18 @@ Tab **Live** di panel tugas menampilkan isi browser QA saat itu juga — halaman
 `bun run check:control` menguji ketiga fitur ini (overlay, ambil alih, tool layar) dengan Chromium sungguhan, tanpa model.
 
 Secara teknis: CDP `Page.startScreencast` → JPEG (lebar 1280, hingga 60 fps — setiap gambar Chromium selama halaman berubah) → MJPEG lewat `multipart/x-mixed-replace`. Header frame berikutnya langsung dikirim di belakang tiap frame, karena Chrome baru menampilkan satu frame MJPEG setelah header frame berikutnya datang. Screencast hanya menyala selama ada yang menonton: tanpa penonton (tab Live tertutup atau tab browser disembunyikan) ia berhenti ±3 detik kemudian supaya Chromium tidak membakar CPU, dan saat tab Live dibuka lagi frame keadaan sekarang datang dalam ±25 ms. Sesi browser yang ditutup tanpa penonton menyimpan satu screenshot penutup, jadi frame yang membeku adalah keadaan akhir halaman. Kalau screencast gagal, fitur ini mati diam-diam dan pengujian tetap berjalan.
+
+## Aksi browser yang melaporkan hasilnya sendiri
+
+Ide terbaik [browser-use](https://github.com/browser-use/browser-use), dibangun ulang di atas Playwright yang sudah ada — tanpa agen kedua, tanpa API key tambahan, dan tanpa kehilangan Live, ambil alih, atau bukti laporan.
+
+- **Sasaran tepat.** `snapshot` memberi setiap elemen yang terlihat sebuah `ref` (`e12`); `click`, `fill`, `hover`, `press`, dan `select_option` menerima ref itu, jadi tombol **Edit** kembar di baris tabel tidak tertukar. `selector`/`text` hanya mengenai elemen yang **terlihat** — duplikat tersembunyi (menu versi mobile, tab tertutup) dilewati.
+- **Menunggu halaman tenang, lalu melaporkan yang berubah.** Setiap aksi menunggu request jaringan yang dipicunya selesai dan DOM diam, lalu hasilnya mencantumkan perubahan halaman: `+ alert [ref=e39]: Data tersimpan`, `~ checkbox "Setuju" [checked]`, `− dialog "Hapus data?"`. Bot tidak perlu lagi `wait` 2–3 detik atau screenshot hanya untuk melihat hasil klik. Long-polling, telemetri, dan animasi JS tidak ditunggu; halaman yang sangat besar (ribuan baris) dilewati ringkasannya supaya aksi tetap cepat.
+- **Kegagalan dijelaskan.** Elemen yang tertutup modal/overlay disebut penutupnya — sengaja tidak diklik lewat JavaScript, karena pengguna pun tidak bisa mengkliknya. Teks yang hanya cocok dengan elemen tersembunyi gagal dalam 2 detik (dulu 10), ref basi menyuruh snapshot ulang, dan opsi `<select>` yang tidak ada disebutkan pilihan yang tersedia.
+- **Unduhan dan ekspor** disimpan ke `downloads/` di folder tugas dan tampil di tab Lampiran. Hasil aksinya menyebut nama, ukuran, jenis berkas dari isinya (ekspor "xlsx" yang ternyata halaman error ketahuan), dan cuplikan isi CSV/teks. Dulu `open` ke URL ekspor gagal dengan "Download is starting".
+- **Detail kecil:** `fill` membaca ulang isinya (maxlength atau mask yang diam-diam memotong isian ketahuan), saran autocomplete dan tooltip/menu hover yang ditunda diberi waktu muncul, `press` menyebut elemen yang fokus sesudahnya (audit urutan Tab), tab baru dilaporkan lalu ditutup, dan isi field password disamarkan di setiap snapshot.
+
+`bun run check:actions` menguji semuanya dengan Chromium sungguhan dan halaman uji lokal, tanpa model.
 
 ## Mode otonomi
 
@@ -264,6 +276,7 @@ data/tasks/T-012/assets/*.png  bukti screenshot
 data/tasks/T-012/report.md     laporan tugas, ditulis bot yang mengerjakannya (tab Laporan)
 data/tasks/T-012/notes.md      catatan pribadi Anda (tab Catatan; tidak dibaca bot)
                                (panel Tanya tidak menulis berkas apa pun — hidup di memori)
+data/tasks/T-012/downloads/*  berkas yang diunduh bot saat menguji ekspor (tab Lampiran)
 data/tasks/T-012/*.md, bukti/*  berkas lain yang ditulis agen (tab Lampiran)
 data/memory.md                 memori global (lintas project)
 data/projects/<id>/project.json  nama, URL target, folder workspace
