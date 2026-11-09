@@ -211,3 +211,40 @@ body {
   .live-cursor { transition: none; }
   .live-ripple, .live-flash { animation: none; opacity: 0; }
 }
+
+/*
+ * Tema @git-diff-view/react dipetakan ke token di atas, jadi light/dark/system
+ * ikut otomatis. Selector diawali .dv-host supaya menang specificity atas CSS library.
+ */
+.dv-host .diff-tailwindcss-wrapper[data-theme] .diff-style-root {
+  --diff-border--: var(--line);
+  --diff-add-content--: var(--tag-green-bg);
+  --diff-del-content--: var(--tag-red-bg);
+  --diff-add-lineNumber--: color-mix(in srgb, var(--tag-green-bg), var(--tag-green-ink) 14%);
+  --diff-del-lineNumber--: color-mix(in srgb, var(--tag-red-bg), var(--tag-red-ink) 14%);
+  --diff-plain-content--: var(--page);
+  --diff-expand-content--: var(--accent-soft);
+  --diff-plain-lineNumber--: var(--panel);
+  --diff-expand-lineNumber--: color-mix(in srgb, var(--accent-soft), var(--accent) 14%);
+  --diff-plain-lineNumber-color--: var(--faint);
+  --diff-expand-lineNumber-color--: var(--accent-ink);
+  --diff-hunk-content--: var(--accent-soft);
+  --diff-hunk-lineNumber--: color-mix(in srgb, var(--accent-soft), var(--accent) 14%);
+  --diff-hunk-lineNumber-hover--: var(--accent);
+  --diff-add-content-highlight--: color-mix(in srgb, var(--tag-green-bg), var(--tag-green-ink) 28%);
+  --diff-del-content-highlight--: color-mix(in srgb, var(--tag-red-bg), var(--tag-red-ink) 28%);
+  --diff-add-widget--: var(--accent);
+  --diff-add-widget-color--: var(--on-accent);
+  --diff-empty-content--: var(--panel);
+  --diff-hunk-content-color--: var(--accent-ink);
+}
+
+.dv-host .diff-tailwindcss-wrapper[data-theme] [data-state="diff"],
+.dv-host .diff-tailwindcss-wrapper[data-theme] [data-state="plain"],
+.dv-host .diff-tailwindcss-wrapper[data-theme] [data-state="hunk"] {
+  color: var(--ink);
+}
+
+.dv-host .diff-tailwindcss-wrapper {
+  font-family: var(--font-mono);
+}

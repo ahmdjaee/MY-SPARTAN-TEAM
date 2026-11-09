@@ -5,6 +5,9 @@ import { workspaceForProject } from "../projects.ts";
 
 const run = promisify(execFile);
 
+/** Batas file untracked yang di-diff, supaya folder besar (mis. build) tidak membanjiri respons. */
+const UNTRACKED_LIMIT = 50;
+
 export const workspaceRouter = Router();
 
 async function git(dir: string, args: string[]): Promise<string> {
@@ -25,14 +28,30 @@ workspaceRouter.get("/workspace/diff", async (req, res) => {
   const dir = workspaceForProject(typeof req.query.project === "string" ? req.query.project : undefined);
   const isRepo = (await git(dir, ["rev-parse", "--is-inside-work-tree"])).trim() === "true";
   if (!isRepo) {
-    res.json({ isRepo: false, dir, status: "", diff: "", branch: "" });
+    res.json({ isRepo: false, dir, status: "", diff: "", staged: "", unstaged: "", untracked: "", branch: "" });
     return;
   }
-  const [status, diff, staged, branch] = await Promise.all([
+  const [status, diff, staged, branch, untrackedList] = await Promise.all([
     git(dir, ["status", "--porcelain=v1"]),
     git(dir, ["diff"]),
     git(dir, ["diff", "--staged"]),
     git(dir, ["rev-parse", "--abbrev-ref", "HEAD"]),
+    git(dir, ["ls-files", "--others", "--exclude-standard"]),
   ]);
-  res.json({ isRepo: true, dir, status, diff: `${staged}${diff}`, branch: branch.trim() });
+  // `git diff` tidak menyertakan file baru yang belum dilacak; buat diff-nya satu per satu.
+  const untrackedFiles = untrackedList.split("\n").filter(Boolean).slice(0, UNTRACKED_LIMIT);
+  const untracked = (
+    await Promise.all(untrackedFiles.map((file) => git(dir, ["diff", "--no-index", "--", "/dev/null", file])))
+  ).join("");
+  res.json({
+    isRepo: true,
+    dir,
+    status,
+    // `diff` (gabungan) dipertahankan agar klien lama tetap jalan.
+    diff: `${staged}${diff}`,
+    staged,
+    unstaged: diff,
+    untracked,
+    branch: branch.trim(),
+  });
 });

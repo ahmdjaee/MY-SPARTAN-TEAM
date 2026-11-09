@@ -264,7 +264,17 @@ export const api = {
     request<{ text: string }>("/api/memory", { method: "PUT", body: JSON.stringify({ text }) }),
 
   diff: (projectId?: string) =>
-    request<{ isRepo: boolean; dir: string; branch: string; status: string; diff: string }>(
+    request<{
+      isRepo: boolean;
+      dir: string;
+      branch: string;
+      status: string;
+      /** Gabungan staged + unstaged (kompatibilitas). */
+      diff: string;
+      staged: string;
+      unstaged: string;
+      untracked: string;
+    }>(
       `/api/workspace/diff${projectId ? `?project=${encodeURIComponent(projectId)}` : ""}`,
     ),
 };
