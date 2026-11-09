@@ -467,7 +467,7 @@ export function TaskDetail({
                 tab === value ? "bg-hover text-ink" : "text-muted hover:bg-hover"
               }`}
             >
-              {value === "live" && detail.live.active && (
+              {value === "live" && live.active && (
                 <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-tag-red-ink" />
               )}
               {value === "notes" && detail.hasNotes && <span className="h-1.5 w-1.5 rounded-full bg-accent" />}
