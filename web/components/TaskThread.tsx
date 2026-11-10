@@ -197,6 +197,10 @@ export function TaskThread({
 
   // Toleransi supaya "hampir di dasar" tetap dihitung sedang mengikuti.
   const NEAR_BOTTOM = 80;
+  // Jarak dari atas tempat riwayat lama mulai dimuat, sebelum Anda benar-benar sampai di ujung.
+  const LOAD_OLDER_THRESHOLD = 200;
+  // Event scroll datang beruntun sebelum `loadingOlder` sempat berubah: cegah permintaan ganda.
+  const fetchingOlder = useRef(false);
 
   const onScroll = () => {
     const el = viewport.current;
@@ -205,6 +209,8 @@ export function TaskThread({
     stick.current = bottomNow;
     setAtBottom(bottomNow);
     if (bottomNow) setHasNew(false);
+    // Hanya dipicu oleh guliran Anda — kalau gagal, guliran berikutnya yang mencoba lagi.
+    if (hasMore && !loadingOlder && el.scrollTop < LOAD_OLDER_THRESHOLD) void loadOlder();
   };
 
   const jumpToBottom = (behavior: ScrollBehavior = "smooth") => {
@@ -265,14 +271,29 @@ export function TaskThread({
   }, []);
 
   const loadOlder = async () => {
+    if (fetchingOlder.current || !onLoadOlder) return;
+    fetchingOlder.current = true;
     const el = viewport.current;
     const before = el?.scrollHeight ?? 0;
-    await onLoadOlder?.();
+    try {
+      await onLoadOlder();
+    } finally {
+      fetchingOlder.current = false;
+    }
     // Baris lama masuk di atas: pertahankan apa yang sedang Anda baca di tempatnya.
     requestAnimationFrame(() => {
       if (el) el.scrollTop += el.scrollHeight - before;
     });
   };
+
+  // Thread yang belum cukup panjang untuk digulir tidak akan pernah memicu guliran: muat langsung.
+  // Bergantung pada jumlah event, jadi kegagalan tidak berulang terus-menerus.
+  const eventCount = events.length;
+  useEffect(() => {
+    const el = viewport.current;
+    if (!el || !hasMore || loadingOlder) return;
+    if (el.scrollHeight <= el.clientHeight) void loadOlder();
+  }, [eventCount, hasMore, loadingOlder]);
 
   const resolved = useMemo(() => {
     const ids = new Set<string>();
@@ -325,22 +346,12 @@ export function TaskThread({
   return (
     <div className="flex h-full flex-col">
       <div className="relative min-h-0 flex-1">
-        <div ref={viewport} onScroll={onScroll} className="thread-rows h-full space-y-3 overflow-y-auto px-5 py-4">
+        <div ref={viewport} onScroll={onScroll} className="thread-rows h-full space-y-3 overflow-y-auto px-5 py-4 [overflow-anchor:none]">
           {error && (
             <div className="rounded-lg border border-line bg-tag-red p-3 text-sm text-tag-red-ink">{error}</div>
           )}
 
-          {hasMore && (
-            <div className="flex justify-center">
-              <button
-                onClick={() => void loadOlder()}
-                disabled={loadingOlder}
-                className="rounded-full border border-line px-3 py-1 text-xs text-muted hover:bg-hover hover:text-ink disabled:opacity-50"
-              >
-                {loadingOlder ? "Memuat…" : "Muat lebih lama ↑"}
-              </button>
-            </div>
-          )}
+          {loadingOlder && <div className="text-center text-xs text-muted">Memuat…</div>}
 
           {rows}
 
