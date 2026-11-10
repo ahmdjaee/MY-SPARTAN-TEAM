@@ -26,6 +26,7 @@
     "check:control": "bun scripts/check-control.ts",
     "check:actions": "bun scripts/check-actions.ts",
     "check:diff": "bun scripts/check-diff.ts",
+    "check:delete": "bun scripts/check-delete.ts",
     "fix:costs": "bun scripts/fix-costs.ts",
     "gate:suggest": "bun scripts/gates/suggest-collapse.ts",
     "gate:recap": "bun scripts/gates/project-recap.ts",

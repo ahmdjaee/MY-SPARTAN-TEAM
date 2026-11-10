@@ -13,7 +13,7 @@ import { ProjectPage } from "./components/ProjectPage.tsx";
 import { Settings } from "./components/Settings.tsx";
 import { TaskDetail } from "./components/TaskDetail.tsx";
 
-export const TABS = ["work", "live", "report", "docs", "notes", "diff"] as const;
+export const TABS = ["work", "live", "report", "docs", "notes", "diff", "settings"] as const;
 export type Tab = (typeof TABS)[number];
 
 export function isTab(value: string | undefined): value is Tab {

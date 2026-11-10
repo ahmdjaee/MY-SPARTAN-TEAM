@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api, type ContextUsage, type LiveState, type StoredEvent, type TaskDetail, type WorkerStatus } from "./api.ts";
+import { ApiError, api, type ContextUsage, type LiveState, type StoredEvent, type TaskDetail, type WorkerStatus } from "./api.ts";
 import { onConnection, subscribe } from "./realtime.ts";
 
 export type TaskThread = {
@@ -15,6 +15,8 @@ export type TaskThread = {
   reportRevision: number;
   /** Gagal memuat tugas (mis. id tidak ada). Putusnya sambungan bukan error — lihat `disconnected`. */
   error?: string;
+  /** Tugas ini baru saja dihapus (dari tab ini atau tab lain) selagi terbuka. */
+  deleted: boolean;
   /** WebSocket sedang terputus dan browser mencoba menyambung ulang. */
   disconnected: boolean;
   /** Masih ada event lebih lama di server. */
@@ -95,6 +97,7 @@ type StreamEvent =
   | StoredEvent
   | ({ type: "live" } & LiveState)
   | { type: "task_changed" }
+  | { type: "task_deleted" }
   | { type: "resync" };
 
 /** Tanpa WebSocket (mis. proxy belum meneruskan Upgrade) isi tugas tetap tampil, hanya tidak live. */
@@ -118,6 +121,7 @@ export function useTaskThread(taskId: string | undefined, refreshKey: number): T
   const [live, setLive] = useState<LiveState>({ active: false });
   const [reportRevision, setReportRevision] = useState(0);
   const [error, setError] = useState<string>();
+  const [deleted, setDeleted] = useState(false);
   const [disconnected, setDisconnected] = useState(false);
   const [hasMore, setHasMore] = useState(false);
   const [loadingOlder, setLoadingOlder] = useState(false);
@@ -161,6 +165,7 @@ export function useTaskThread(taskId: string | undefined, refreshKey: number): T
     setLive({ active: false });
     setEvents([]);
     setError(undefined);
+    setDeleted(false);
     setDisconnected(false);
     setHasMore(false);
     clearStream();
@@ -194,7 +199,12 @@ export function useTaskThread(taskId: string | undefined, refreshKey: number): T
           baseline = true;
           setError(undefined);
         })
-        .catch((cause: Error) => active && !baseline && setError(cause.message));
+        .catch((cause: Error) => {
+          if (!active || baseline) return;
+          setError(cause.message);
+          // 410: alamat tugas yang sudah dihapus (bookmark, tautan lama).
+          if (cause instanceof ApiError && cause.status === 410) setDeleted(true);
+        });
     };
 
     const refreshMeta = () => {
@@ -243,6 +253,10 @@ export function useTaskThread(taskId: string | undefined, refreshKey: number): T
         }
         if (event.type === "task_changed") {
           refreshMeta();
+          return;
+        }
+        if (event.type === "task_deleted") {
+          setDeleted(true);
           return;
         }
         if (event.type === "resync") {
@@ -345,6 +359,7 @@ export function useTaskThread(taskId: string | undefined, refreshKey: number): T
     live,
     reportRevision,
     error,
+    deleted,
     disconnected,
     hasMore,
     loadingOlder,

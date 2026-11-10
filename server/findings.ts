@@ -10,6 +10,7 @@ import { createHash } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { notifyProject } from "./changes.ts";
+import { isDeleted } from "./deleted-tasks.ts";
 import { projectDir } from "./projects.ts";
 import type { RecapEntry, RecapSeverity } from "./recap.ts";
 import { ACTIVE_STATUSES, reportPath, tasksInProject } from "./tasks.ts";
@@ -612,12 +613,28 @@ export function unlinkedFindings(projectId: string, register: Register, entries:
     );
 }
 
+/** Semua ID tugas yang dirujuk register dan cakupan — dasar label "dihapus" di report project. */
+export function referencedTaskIds(register: Register, coverage: CoverageCell[]): Set<string> {
+  const ids = new Set<string>();
+  for (const finding of register.findings) {
+    for (const item of finding.occurrences) ids.add(item.taskId);
+    if (finding.fix) ids.add(finding.fix.taskId);
+    if (finding.retest) ids.add(finding.retest.taskId);
+  }
+  for (const cell of coverage) if (cell.taskId) ids.add(cell.taskId);
+  return ids;
+}
+
 // ---------- ringkasan untuk konteks agen ----------
 
 const FIXED_RECENT_MS = 14 * 24 * 60 * 60 * 1000;
 
 function line(finding: Finding): string {
-  const tasks = [...new Set(finding.occurrences.map((item) => item.taskId))].slice(-4).join(",");
+  // Tugas yang dihapus diberi tanda supaya agen tidak mencoba membuka foldernya.
+  const tasks = [...new Set(finding.occurrences.map((item) => item.taskId))]
+    .slice(-4)
+    .map((id) => (isDeleted(id) ? `${id} (dihapus)` : id))
+    .join(",");
   const resolved = finding.resolution && !OPEN_STATUSES.includes(finding.status) ? ` — ${finding.resolution.note.slice(0, 120)}` : "";
   return `- ${finding.id} · ${finding.severity} · ${finding.status} · ${finding.title}${finding.area ? ` · ${finding.area}` : ""}${tasks ? ` · ${tasks}` : ""}${resolved}`;
 }

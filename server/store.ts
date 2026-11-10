@@ -1,6 +1,7 @@
 import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { CONFIG } from "./config.ts";
+import { isDeleted } from "./deleted-tasks.ts";
 import { EPHEMERAL_EVENTS, type RoleId, type StoredEvent, type UiEvent } from "./types.ts";
 
 /** `dir`: folder tugas sudah pasti ada — mkdirSync tidak perlu diulang di setiap event. */
@@ -73,6 +74,9 @@ class ThreadStore {
     cached.lastSeq += 1;
     const stored = { ...event, seq: cached.lastSeq, ts: new Date().toISOString(), taskId, role } as StoredEvent;
     if (EPHEMERAL_EVENTS.has(event.type)) return stored;
+    // Event yang datang terlambat (mis. permintaan yang ditutup saat runner berhenti) tidak boleh
+    // membuat ulang folder tugas yang sudah dihapus. Penyimak yang masih tersambung tetap menerimanya.
+    if (isDeleted(taskId)) return stored;
     const line = JSON.stringify(stored);
     cached.events.push(stored);
     cached.bytes += line.length;
@@ -120,6 +124,11 @@ class ThreadStore {
 
   lastSeqOf(taskId: string): number {
     return this.touch(taskId).lastSeq;
+  }
+
+  /** Buang transcript dari cache — dipanggil setelah tugasnya dihapus. */
+  forget(taskId: string): void {
+    this.cache.delete(taskId);
   }
 }
 

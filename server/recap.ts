@@ -11,6 +11,7 @@
  */
 import { statSync } from "node:fs";
 import { lastSummary } from "./context.ts";
+import { deletedInProject } from "./deleted-tasks.ts";
 import { listAssets, readReport, reportPath, tasksInProject, type TaskStatus } from "./tasks.ts";
 import type { RoleId } from "./types.ts";
 
@@ -61,10 +62,18 @@ export type RecapTotals = {
   costUsd: number;
 };
 
+/** Baris rekap tugas yang sudah dihapus: snapshot terakhirnya, tanpa laporan yang bisa dibuka. */
+export type DeletedRecapEntry = RecapEntry & { deletedAt: string };
+
 export type ProjectRecap = {
   projectId: string;
   generatedAt: string;
   entries: RecapEntry[];
+  /**
+   * Tugas project ini yang sudah dihapus, terbaru dulu. Sengaja terpisah dari `entries`:
+   * totals, emptyCount, dan temuan yang belum tertaut hanya menghitung tugas yang masih ada.
+   */
+  deleted: DeletedRecapEntry[];
   /** Tugas yang belum punya laporan maupun ringkasan — tidak jadi baris, hanya dihitung. */
   emptyCount: number;
   totals: RecapTotals;
@@ -299,6 +308,11 @@ export function buildProjectRecap(projectId: string, options: { fresh?: boolean 
   return value;
 }
 
+/** Buang rekap tersimpan — dipanggil saat tugas project ini dihapus, supaya barisnya tidak tertinggal 3 detik. */
+export function forgetProjectRecap(projectId: string): void {
+  recapCache.delete(projectId);
+}
+
 function computeProjectRecap(projectId: string): ProjectRecap {
   const entries: RecapEntry[] = [];
   let emptyCount = 0;
@@ -352,6 +366,22 @@ function computeProjectRecap(projectId: string): ProjectRecap {
     projectId,
     generatedAt: new Date().toISOString(),
     entries,
+    deleted: deletedInProject(projectId).map((task) => ({
+      // Tugas tanpa laporan maupun ringkasan tidak punya snapshot — barisnya tetap ada.
+      ...(task.recap ?? {
+        taskId: task.id,
+        title: task.title,
+        role: task.role,
+        status: task.status,
+        source: "summary",
+        findings: [],
+        assetCount: 0,
+        costUsd: task.costUsd,
+        updatedAt: task.deletedAt,
+        changedAt: task.deletedAt,
+      }),
+      deletedAt: task.deletedAt,
+    })),
     emptyCount,
     totals: {
       reports: entries.filter((entry) => entry.source === "report").length,

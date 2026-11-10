@@ -92,6 +92,10 @@ otomatis saat start berikutnya. Kalau ingin hidup sejak boot tanpa login: `login
 5. Tab **Kerja** hanya ikut turun kalau Anda memang sedang berada di dasar. Begitu Anda scroll ke atas untuk membaca chat lama, tampilan diam walau agen terus menulis; yang muncul cuma tombol **Pesan baru ↓** (berubah kuning jadi **Menunggu keputusan Anda ↓** kalau ada kartu persetujuan). Kembali ke dasar — lewat tombol itu atau scroll sendiri — membuatnya mengikuti lagi.
 6. **Oper ke…** memindahkan tugas ke bot lain. Bot baru menerima instruksi asli, **ringkasan serah terima** bot sebelumnya, catatan operan Anda, dan daftar bukti yang sudah ada. Riwayatnya tampil sebagai `QA → Engineer → QA`.
 7. Bot bisa **mengusulkan** operan sendiri (`suggest_handoff`); usulan muncul sebagai tombol satu-klik, tidak pernah jalan tanpa Anda.
+8. **Menghapus tugas** hanya bisa dari tab **Setelan** (paling kanan di deretan tab), di kotak **Zona berbahaya**: dialognya baru mengizinkan hapus setelah Anda mengetik ID tugasnya (mis. `T-015`). Tugas yang masih antre, berjalan, atau menunggu keputusan harus di-**Batalkan** dulu.
+   - Yang terhapus permanen: seluruh folder `data/tasks/<id>/` — transcript, `report.md`, screenshot bukti, lampiran, berkas `uploads/`/`downloads/`, dan catatan Anda. Agen, browser QA, dan panel Tanya tugas itu ikut ditutup.
+   - Yang tetap: register temuan, cakupan uji, dan log kurasi project. Di **Report project**, rujukan ke tugas itu tampil dicoret dengan label *dihapus* (tanpa tautan), dan barisnya di *Lampiran: laporan per tugas* tetap ada dengan verdict, ringkasan, dan daftar temuan terakhir sebelum dihapus. "Download report lengkap" ikut menandainya `(dihapus)`.
+   - Catatannya disimpan di `data/deleted-tasks.json`, sehingga ID tugas yang dihapus tidak pernah dipakai ulang. Alamat lama tugas itu menampilkan kartu "sudah dihapus", dan tab lain yang sedang membukanya ikut berganti ke kartu itu.
 
 Contoh tugas:
 
@@ -108,7 +112,7 @@ Posisi Anda tersimpan di alamat, jadi refresh — termasuk setelah `systemctl --
 ```
 /                                 daftar; langsung membuka tugas teratas
 /tasks/T-015                      tab bawaan (Kerja), atau Live kalau browser QA sedang hidup
-/tasks/T-015/report               tab: work · live · report · docs · notes · diff
+/tasks/T-015/report               tab: work · live · report · docs · notes · diff · settings
 /tasks/T-015/report?section=findings   bagian laporan: findings · resolved (bawaan: Report utama)
 /tasks/T-015/docs?doc=audit.md    lampiran yang sedang dibaca
 /tasks/T-015/notes?view=preview   catatan pribadi Anda untuk tugas itu

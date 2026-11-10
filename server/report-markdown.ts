@@ -4,9 +4,10 @@
  * Fungsi murni: seluruh data disuplai pemanggil. Kedua berkas selalu memuat semua temuan aktif,
  * tidak mengikuti saringan yang sedang dipakai di tab Report.
  */
+import type { DeletedRef } from "./deleted-tasks.ts";
 import type { CoverageCell, CoverageState, Finding, FindingSeverity, FindingStatus } from "./findings.ts";
 import { OPEN_STATUSES } from "./findings.ts";
-import type { ProjectRecap, RecapEntry, RecapSeverity, RecapTone } from "./recap.ts";
+import type { DeletedRecapEntry, ProjectRecap, RecapEntry, RecapSeverity, RecapTone } from "./recap.ts";
 import type { TaskFinding, TaskUnlinkedFinding } from "./task-report.ts";
 
 const STATUS_LABEL: Record<FindingStatus, string> = {
@@ -62,10 +63,12 @@ export type ReportMarkdownInput = FindingsMarkdownInput & {
   state: string;
   coverage: CoverageCell[];
   recap: ProjectRecap;
+  /** Tugas yang sudah dihapus; rujukannya diberi label "(dihapus)". */
+  deleted?: Record<string, DeletedRef>;
 };
 
 /** occurrences = sertakan daftar "Dilaporkan di" pada tiap temuan. */
-type FindingOptions = { occurrences: boolean };
+type FindingOptions = { occurrences: boolean; deleted?: Record<string, DeletedRef> };
 
 function stamp(iso: string): string {
   return new Date(iso).toLocaleString("id-ID", { dateStyle: "medium", timeStyle: "short" });
@@ -112,7 +115,8 @@ function findingBlock(finding: Finding, options: FindingOptions): string {
     const rows = finding.occurrences.map((item) => {
       const local = item.localId ? ` ${inline(item.localId)}` : "";
       const note = item.note ? `: ${inline(item.note)}` : "";
-      return `- \`${item.taskId}\`${local} (${stamp(item.at)})${note}`;
+      const gone = options.deleted?.[item.taskId] ? " (dihapus)" : "";
+      return `- \`${item.taskId}\`${gone}${local} (${stamp(item.at)})${note}`;
     });
     parts.push(`**Dilaporkan di:**\n\n${rows.join("\n")}`);
   }
@@ -154,9 +158,10 @@ function coverageSection(cells: CoverageCell[]): string {
   return `## Cakupan uji\n\n${lines.join("\n")}`;
 }
 
-function recapEntry(entry: RecapEntry): string {
+function recapEntry(entry: RecapEntry | DeletedRecapEntry): string {
   const facts = [`**Tugas:** \`${entry.taskId}\``, `**Peran:** ${entry.role}`, `**Status:** ${entry.status}`];
   if (entry.verdict) facts.push(`**Verdict:** ${TONE_MARK[entry.verdict.tone]} ${inline(entry.verdict.text)}`);
+  if ("deletedAt" in entry) facts.push(`**Dihapus:** ${stamp(entry.deletedAt)} — lampiran tidak tersedia`);
 
   const parts = [`### ${inline(entry.title)}`, facts.join(" · ")];
   if (entry.summary?.trim()) parts.push(nested(entry.summary, 3));
@@ -249,11 +254,12 @@ export function renderFindingsMarkdown(input: FindingsMarkdownInput): string {
 }
 
 export function renderReportMarkdown(input: ReportMarkdownInput): string {
-  const entries = input.recap.entries;
+  // Tugas yang dihapus tetap tercantum (dari snapshot-nya), di bawah tugas yang masih ada.
+  const entries = [...input.recap.entries, ...(input.recap.deleted ?? [])];
   const sections = [
     ...headerSections(input),
     `## Kesimpulan\n\n${nested(input.state, 2) || "Belum ada kesimpulan."}`,
-    registerSection(input.findings, { occurrences: true }),
+    registerSection(input.findings, { occurrences: true, deleted: input.deleted }),
     coverageSection(input.coverage),
     `## Lampiran: laporan per tugas (${entries.length})\n\n${entries.length > 0 ? entries.map(recapEntry).join("\n\n") : "Belum ada laporan."}`,
   ];
