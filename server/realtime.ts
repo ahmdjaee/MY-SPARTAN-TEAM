@@ -12,7 +12,8 @@
  *
  * Topik:
  * - `global`        attention (notifikasi browser) + `tasks_changed`
- * - `task:<id>`     status & permintaan terbuka, `live`, replay setelah `after`, event bus, `task_changed`
+ * - `task:<id>`     status & permintaan terbuka, `live`, replay setelah `after`, event bus, `task_changed`,
+ *                   `task_deleted` (tugasnya baru saja dihapus)
  * - `ask:<id>`      `snapshot` panel Tanya, lalu delta/answer/busy/error
  * - `project:<id>`  `project_changed` (temuan/kurator) dan `project_tasks_changed`
  * - `live:<id>`     `browser_action` — aksi agen untuk overlay tab Live (hanya selama tab itu terbuka)
@@ -32,7 +33,7 @@ import { onProjectChanged } from "./changes.ts";
 import { rejectReason } from "./http-guard.ts";
 import { getProject } from "./projects.ts";
 import { threads } from "./store.ts";
-import { getTask, onTasksChanged } from "./tasks.ts";
+import { getTask, onTaskRemoved, onTasksChanged } from "./tasks.ts";
 
 export const REALTIME_PATH = "/api/ws";
 
@@ -123,11 +124,13 @@ function globalTopic(emit: Emit): () => void {
   const offAttention = bus.subscribeAll((attention) => emit({ type: "attention", attention }));
   const tasksChanged = coalesce(() => emit({ type: "tasks_changed" }));
   const offTasks = onTasksChanged(() => tasksChanged.trigger());
+  const offRemoved = onTaskRemoved(() => tasksChanged.trigger());
   // Browser bot mulai/berhenti tidak menulis task.json, tapi daftar tugas menampilkan "● live".
   const offLive = live.onActiveChange(() => tasksChanged.trigger());
   return () => {
     offAttention();
     offTasks();
+    offRemoved();
     offLive();
     tasksChanged.cancel();
   };
@@ -155,10 +158,17 @@ function taskTopic(taskId: string, after: number | undefined, emit: Emit): (() =
   const offTask = onTasksChanged((changed) => {
     if (changed.id === taskId) taskChanged.trigger();
   });
+  // Tidak digabung: setelah ini tidak ada lagi task_changed yang bisa menyusul.
+  const offRemoved = onTaskRemoved((removed) => {
+    if (removed.id !== taskId) return;
+    taskChanged.cancel();
+    emit({ type: "task_deleted" });
+  });
   return () => {
     offBus();
     offLive();
     offTask();
+    offRemoved();
     taskChanged.cancel();
   };
 }
@@ -181,9 +191,13 @@ function projectTopic(projectId: string, emit: Emit): (() => void) | string {
   const offTasks = onTasksChanged((task) => {
     if (task.projectId === projectId) tasks.trigger();
   });
+  const offRemoved = onTaskRemoved((task) => {
+    if (task.projectId === projectId) tasks.trigger();
+  });
   return () => {
     offData();
     offTasks();
+    offRemoved();
     data.cancel();
     tasks.cancel();
   };

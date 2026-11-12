@@ -13,7 +13,8 @@ import {
   writeProjectMemory,
   type Project,
 } from "../projects.ts";
-import { buildProjectRecap } from "../recap.ts";
+import { deletedRefs, type DeletedRef } from "../deleted-tasks.ts";
+import { buildProjectRecap, type ProjectRecap } from "../recap.ts";
 import { renderFindingsMarkdown, renderReportMarkdown } from "../report-markdown.ts";
 import { curator } from "../agent/curator.ts";
 import {
@@ -25,15 +26,22 @@ import {
   readLog,
   readRegister,
   readState,
+  referencedTaskIds,
   revertLog,
   setFindingStatus,
   unlinkedFindings,
+  type CoverageCell,
   type FindingStatus,
   type Register,
 } from "../findings.ts";
 import { listTasks, tasksInProject } from "../tasks.ts";
 
 export const projectsRouter = Router();
+
+/** Tugas dihapus yang masih dirujuk report project: register, cakupan, atau baris rekapnya. */
+function deletedTasksFor(register: Register, coverage: CoverageCell[], recap: ProjectRecap): Record<string, DeletedRef> {
+  return deletedRefs([...referencedTaskIds(register, coverage), ...recap.deleted.map((entry) => entry.taskId)]);
+}
 
 /** Cukup angka dari indeks memori — listTasks() ikut membaca folder aset tiap tugas aktif. */
 function withStats(project: Project) {
@@ -113,6 +121,7 @@ projectsRouter.get("/projects/:id/report", (req, res) => {
   try {
     const register = readRegister(project.id);
     const recap = buildProjectRecap(project.id);
+    const coverage = readCoverage(project.id);
     res.json({
       projectId: project.id,
       generatedAt: new Date().toISOString(),
@@ -120,7 +129,8 @@ projectsRouter.get("/projects/:id/report", (req, res) => {
       findings: register.findings,
       unlinked: unlinkedFindings(project.id, register, recap.entries),
       counts: counts(project.id, register),
-      coverage: readCoverage(project.id),
+      coverage,
+      deletedTasks: deletedTasksFor(register, coverage, recap),
       curator: curator.status(project.id),
       log: readLog(project.id, 40).map((entry) => ({
         at: entry.at,
@@ -161,17 +171,20 @@ function markdownDownload(path: string, prefix: string, render: (project: Projec
 }
 
 /** Report lengkap: sama dengan isi tab Report, tanpa log kurasi. */
-markdownDownload("/projects/:id/report.md", "report", (project, register) =>
-  renderReportMarkdown({
+markdownDownload("/projects/:id/report.md", "report", (project, register) => {
+  const coverage = readCoverage(project.id);
+  const recap = buildProjectRecap(project.id);
+  return renderReportMarkdown({
     project,
     generatedAt: new Date().toISOString(),
     state: readState(project.id),
     findings: register.findings,
     counts: counts(project.id, register),
-    coverage: readCoverage(project.id),
-    recap: buildProjectRecap(project.id),
-  }),
-);
+    coverage,
+    recap,
+    deleted: deletedTasksFor(register, coverage, recap),
+  });
+});
 
 /** Temuan saja: Ringkasan dan register, tanpa kesimpulan, cakupan, lampiran, dan daftar pelapor. */
 markdownDownload("/projects/:id/findings.md", "temuan", (project, register) =>

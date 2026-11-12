@@ -1,3 +1,5 @@
+import { control } from "../browser/control.ts";
+import { closeBrowserFor } from "../browser/mcp.ts";
 import { CONFIG } from "../config.ts";
 import { composeHandoffMessage, composeOpeningMessage, composeReviewMessage } from "../messages.ts";
 import { ROLES } from "../roles.ts";
@@ -232,6 +234,22 @@ class Scheduler {
       this.runners.delete(taskId);
     }
     updateTask(taskId, { status: "cancelled", finishedAt: new Date().toISOString() });
+  }
+
+  /**
+   * Lepas semua yang masih hidup untuk tugas ini — agen, browser QA, kendali owner — tanpa
+   * mengubah statusnya. Dipakai sebelum tugas dihapus.
+   */
+  async dispose(taskId: string): Promise<void> {
+    const runner = this.runners.get(taskId);
+    if (runner) {
+      await runner.interrupt();
+      await runner.close();
+      this.runners.delete(taskId);
+    }
+    // Runner sudah menutup browsernya; ini untuk sesi yang hidup tanpa runner (mis. setelah oper).
+    await closeBrowserFor(taskId);
+    control.release(taskId, undefined, "Tugas dihapus.");
   }
 
   /** Oper tugas ke bot lain: runner lama ditutup, bot baru dapat konteks lengkap. */

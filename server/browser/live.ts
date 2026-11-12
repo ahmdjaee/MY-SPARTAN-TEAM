@@ -343,6 +343,20 @@ export class LiveHub {
     this.fresh.delete(taskId);
     this.setState(taskId, { active: false });
   }
+
+  /**
+   * Tugasnya dihapus: buang frame terakhir dan statusnya. Penonton dan penyimak yang masih
+   * tersambung dilepas sendiri saat kliennya pindah halaman.
+   */
+  forget(taskId: string): void {
+    this.stop(taskId);
+    this.frames.delete(taskId);
+    this.states.delete(taskId);
+    this.announced.delete(taskId);
+    const timer = this.idleTimers.get(taskId);
+    if (timer) clearTimeout(timer);
+    this.idleTimers.delete(taskId);
+  }
 }
 
 export const live = new LiveHub();

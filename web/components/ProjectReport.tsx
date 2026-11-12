@@ -4,6 +4,7 @@ import {
   api,
   type CoverageCell,
   type CoverageState,
+  type DeletedRef,
   type Finding,
   type FindingSeverity,
   type FindingStatus,
@@ -61,6 +62,29 @@ const H = "flex items-center gap-2 border-b border-line px-3 py-2 text-sm font-s
 function stamp(iso?: string): string {
   if (!iso) return "—";
   return new Date(iso).toLocaleString("id-ID", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
+}
+
+type DeletedTasks = Record<string, DeletedRef>;
+
+/**
+ * Rujukan ke tugas: tautan biasa, atau — kalau tugasnya sudah dihapus — ID yang dicoret dengan
+ * label "dihapus". Tidak ada tautan ke halaman yang sudah tidak ada.
+ */
+function TaskRef({ taskId, deleted, search }: { taskId: string; deleted: DeletedTasks; search: URLSearchParams }) {
+  const gone = deleted[taskId];
+  if (!gone) {
+    return (
+      <Link to={taskPath(taskId, "report", search)} className="shrink-0 font-mono text-accent hover:underline">
+        {taskId}
+      </Link>
+    );
+  }
+  return (
+    <span data-task-ref-deleted={taskId} title={`${gone.title} — dihapus ${stamp(gone.deletedAt)}`} className="inline-flex shrink-0 items-baseline gap-1">
+      <span className="font-mono text-faint line-through">{taskId}</span>
+      <span className="rounded bg-hover px-1 text-[10px] text-muted">dihapus</span>
+    </span>
+  );
 }
 
 /** Kesimpulan diambil dari baris "**Kesimpulan:**" yang ditulis kurator. */
@@ -300,6 +324,7 @@ export function ProjectReport({ projectId, search }: { projectId: string; search
                 others={active}
                 search={search}
                 onChanged={() => void load()}
+                deleted={report.deletedTasks}
               />
             ))}
           </ul>
@@ -317,9 +342,7 @@ export function ProjectReport({ projectId, search }: { projectId: string; search
             <ul className="divide-y divide-line">
               {report.unlinked.map((item) => (
                 <li key={`${item.taskId}-${item.id}`} data-unlinked-row className="flex items-baseline gap-2 px-3 py-1.5 text-xs">
-                  <Link to={taskPath(item.taskId, "report", search)} className="shrink-0 font-mono text-accent hover:underline">
-                    {item.taskId}
-                  </Link>
+                  <TaskRef taskId={item.taskId} deleted={report.deletedTasks} search={search} />
                   <span className="shrink-0 font-mono text-faint">{item.id}</span>
                   <span className="shrink-0 rounded bg-hover px-1 text-muted">{item.severity}</span>
                   <span className="min-w-0 flex-1 text-ink">{item.title}</span>
@@ -331,7 +354,7 @@ export function ProjectReport({ projectId, search }: { projectId: string; search
       )}
 
       {/* ---------- cakupan ---------- */}
-      <CoverageMatrix cells={report.coverage} search={search} />
+      <CoverageMatrix cells={report.coverage} deleted={report.deletedTasks} search={search} />
 
       {/* ---------- log kurasi ---------- */}
       <section className={SECTION}>
@@ -372,7 +395,10 @@ export function ProjectReport({ projectId, search }: { projectId: string; search
         <button type="button" onClick={() => setShowTasks((value) => !value)} className={`${H} w-full text-left`} aria-expanded={showTasks}>
           <span aria-hidden className="text-muted">{showTasks ? "▾" : "▸"}</span>
           <span>Lampiran: laporan per tugas</span>
-          <span className="text-xs font-normal text-faint">{report.recap.entries.length} tugas</span>
+          <span className="text-xs font-normal text-faint">
+            {report.recap.entries.length + report.recap.deleted.length} tugas
+            {report.recap.deleted.length > 0 ? ` · ${report.recap.deleted.length} dihapus` : ""}
+          </span>
         </button>
         {showTasks && (
           <div data-recap-root className="p-3">
@@ -392,6 +418,7 @@ const FindingRow = memo(function FindingRow({
   others,
   search,
   onChanged,
+  deleted,
 }: {
   finding: Finding;
   expanded: boolean;
@@ -400,6 +427,7 @@ const FindingRow = memo(function FindingRow({
   others: Finding[];
   search: URLSearchParams;
   onChanged: () => void;
+  deleted: DeletedTasks;
 }) {
   const [status, setStatus] = useState<FindingStatus>(finding.status);
   const [note, setNote] = useState("");
@@ -458,9 +486,7 @@ const FindingRow = memo(function FindingRow({
             <ul className="mt-1 space-y-0.5">
               {finding.occurrences.map((item) => (
                 <li key={`${item.taskId}-${item.localId ?? ""}`} className="flex items-baseline gap-2 text-xs">
-                  <Link to={taskPath(item.taskId, "report", search)} className="font-mono text-accent hover:underline">
-                    {item.taskId}
-                  </Link>
+                  <TaskRef taskId={item.taskId} deleted={deleted} search={search} />
                   {item.localId && <span className="font-mono text-faint">{item.localId}</span>}
                   <span className="text-faint">{stamp(item.at)}</span>
                   {item.note && <span className="text-muted">{item.note}</span>}
@@ -519,7 +545,15 @@ const FindingRow = memo(function FindingRow({
   );
 });
 
-function CoverageMatrix({ cells, search }: { cells: CoverageCell[]; search: URLSearchParams }) {
+function CoverageMatrix({
+  cells,
+  deleted,
+  search,
+}: {
+  cells: CoverageCell[];
+  deleted: DeletedTasks;
+  search: URLSearchParams;
+}) {
   const areas = [...new Set(cells.map((cell) => cell.area))].sort();
   const subjects = [...new Set(cells.map((cell) => cell.subject))].sort();
   const byKey = new Map(cells.map((cell) => [`${cell.area}\u0000${cell.subject}`, cell]));
@@ -557,7 +591,7 @@ function CoverageMatrix({ cells, search }: { cells: CoverageCell[]; search: URLS
                     return (
                       <td key={subject} className="px-2 py-1">
                         {cell ? (
-                          cell.taskId ? (
+                          cell.taskId && !deleted[cell.taskId] ? (
                             <Link
                               to={taskPath(cell.taskId, "report", search)}
                               title={`${cell.taskId}${cell.note ? ` — ${cell.note}` : ""}`}
@@ -566,7 +600,12 @@ function CoverageMatrix({ cells, search }: { cells: CoverageCell[]; search: URLS
                               {COVERAGE_LABEL[cell.state]}
                             </Link>
                           ) : (
-                            <span title={cell.note} className={`inline-block rounded px-1.5 py-0.5 ${COVERAGE_STYLE[cell.state]}`}>
+                            // Tugas sumbernya sudah dihapus: hasil ujinya tetap, tautannya tidak.
+                            <span
+                              data-coverage-deleted={cell.taskId ? cell.taskId : undefined}
+                              title={[cell.taskId ? `${cell.taskId} (dihapus)` : "", cell.note ?? ""].filter(Boolean).join(" — ") || undefined}
+                              className={`inline-block rounded px-1.5 py-0.5 ${COVERAGE_STYLE[cell.state]}`}
+                            >
                               {COVERAGE_LABEL[cell.state]}
                             </span>
                           )

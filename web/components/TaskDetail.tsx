@@ -22,6 +22,7 @@ import { Diff } from "./Diff.tsx";
 import { LiveView, lastBrowserAction } from "./LiveView.tsx";
 import { TaskNotes } from "./TaskNotes.tsx";
 import { TaskReport } from "./TaskReport.tsx";
+import { TaskSettings } from "./TaskSettings.tsx";
 import { TaskThread } from "./TaskThread.tsx";
 
 const ASK_KEY = "ai-team-ask";
@@ -245,6 +246,7 @@ export function TaskDetail({
     live,
     reportRevision,
     error,
+    deleted,
     disconnected,
     hasMore,
     loadingOlder,
@@ -266,6 +268,21 @@ export function TaskDetail({
     autoOpened.current = taskId;
     onTab("live", true);
   }, [detail, live.active, taskId, tabInUrl, onTab]);
+
+  // Dihapus selagi terbuka (di tab ini atau tab lain), atau alamat lama dari tugas yang sudah dihapus.
+  if (deleted) {
+    return (
+      <div className="p-6">
+        <p data-task-deleted className="rounded-lg border border-line bg-panel p-3 text-sm text-muted">
+          Tugas <span className="font-mono text-ink">{taskId}</span> sudah dihapus beserta lampirannya. Rujukannya di
+          Report project tetap ada dengan label dihapus.
+        </p>
+        <Link to="/" className="mt-3 inline-block text-sm text-accent underline underline-offset-2">
+          Kembali ke daftar tugas
+        </Link>
+      </div>
+    );
+  }
 
   if (!detail) {
     // Tautan dalam membuat id yang sudah tidak ada jadi mudah dibuka (mis. bookmark lama).
@@ -458,12 +475,14 @@ export function TaskDetail({
               ["docs", `Lampiran${detail.docs.length ? ` (${detail.docs.length})` : ""}`],
               ["notes", "Catatan"],
               ["diff", "Perubahan"],
+              ["settings", "Setelan"],
             ] as const
           ).map(([value, label]) => (
             <button
               key={value}
               onClick={() => onTab(value)}
-              className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 ${
+              // Setelan di ujung kanan, terpisah dari tab kerja — seperti Settings di GitHub.
+              className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 ${value === "settings" ? "ml-auto" : ""} ${
                 tab === value ? "bg-hover text-ink" : "text-muted hover:bg-hover"
               }`}
             >
@@ -505,6 +524,8 @@ export function TaskDetail({
         {tab === "notes" && <TaskNotes taskId={task.id} onSaved={onChanged} />}
 
         {tab === "diff" && <Diff projectId={detail.project?.id} />}
+
+        {tab === "settings" && <TaskSettings detail={detail} />}
       </div>
 
       </div>

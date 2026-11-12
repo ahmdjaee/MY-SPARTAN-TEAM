@@ -5,12 +5,14 @@ import { curator } from "../agent/curator.ts";
 import { scheduler } from "../agent/scheduler.ts";
 import { BOUNDARY, live } from "../browser/live.ts";
 import { CONFIG } from "../config.ts";
+import { getDeleted } from "../deleted-tasks.ts";
 import { readRegister } from "../findings.ts";
 import { defaultProjectId, getProject, workspaceForProject } from "../projects.ts";
 import { reportRounds, verdictOf } from "../recap.ts";
 import { renderTaskFindingsMarkdown } from "../report-markdown.ts";
 import { ROLES, ROLE_IDS, isRoleId } from "../roles.ts";
 import { threads } from "../store.ts";
+import { DeleteTaskError, deleteTask } from "../task-delete.ts";
 import { buildTaskFindings } from "../task-report.ts";
 import {
   assetsDir,
@@ -34,6 +36,10 @@ import { defaultModeFor } from "../settings.ts";
 export const tasksRouter = Router();
 
 const STATUSES: TaskStatus[] = ["queued", "running", "waiting", "needs_review", "done", "failed", "cancelled"];
+
+function stamp(iso: string): string {
+  return new Date(iso).toLocaleString("id-ID", { dateStyle: "medium", timeStyle: "short" });
+}
 
 tasksRouter.get("/roles", (_req, res) => {
   res.json({
@@ -102,7 +108,10 @@ function positiveInt(raw: unknown): number | undefined {
 tasksRouter.get("/tasks/:id", (req, res) => {
   const task = getTask(req.params.id);
   if (!task) {
-    res.status(404).json({ error: "tugas tidak ditemukan" });
+    const deleted = getDeleted(req.params.id);
+    // 410: alamat lama (bookmark, tautan di report project) memberi tahu kenapa tugasnya tidak ada.
+    if (deleted) res.status(410).json({ error: `tugas sudah dihapus ${stamp(deleted.deletedAt)}` });
+    else res.status(404).json({ error: "tugas tidak ditemukan" });
     return;
   }
   const limit = Math.min(positiveInt(req.query.events) ?? EVENTS_MAX, EVENTS_MAX);
@@ -248,6 +257,29 @@ tasksRouter.post("/tasks/:id/interrupt", async (req, res) => {
 tasksRouter.post("/tasks/:id/cancel", async (req, res) => {
   await scheduler.cancel(req.params.id);
   res.json({ ok: true, task: getTask(req.params.id) });
+});
+
+/**
+ * Hapus tugas beserta seluruh isi foldernya. Body `{ confirm }` harus sama persis dengan ID
+ * tugas — pagar kedua di belakang dialog "ketik ID untuk mengonfirmasi" di tab Setelan.
+ */
+tasksRouter.delete("/tasks/:id", async (req, res) => {
+  const task = getTask(req.params.id);
+  if (!task) {
+    res.status(404).json({ error: "tugas tidak ditemukan" });
+    return;
+  }
+  const confirm = typeof req.body?.confirm === "string" ? req.body.confirm.trim() : "";
+  if (confirm !== task.id) {
+    res.status(400).json({ error: `konfirmasi tidak cocok — ketik ${task.id}` });
+    return;
+  }
+  try {
+    res.json({ ok: true, ...(await deleteTask(task.id)) });
+  } catch (error) {
+    if (error instanceof DeleteTaskError) res.status(error.status).json({ error: error.message });
+    else res.status(500).json({ error: (error as Error).message });
+  }
 });
 
 tasksRouter.post("/tasks/:id/handoff", async (req, res) => {

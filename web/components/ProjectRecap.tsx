@@ -5,8 +5,10 @@ import {
   STATUS_LABEL,
   STATUS_STYLE,
   api,
+  type DeletedRecapEntry,
   type ProjectRecap as RecapData,
   type RecapEntry,
+  type RecapFinding,
   type RecapSeverity,
   type RecapTone,
 } from "../api.ts";
@@ -73,6 +75,71 @@ function preview(text: string): string {
   return text.replace(/[*`]/g, "").replace(/\s+/g, " ").trim();
 }
 
+function FindingList({ findings }: { findings: RecapFinding[] }) {
+  if (findings.length === 0) return null;
+  return (
+    <ul className="space-y-1">
+      {findings.map((finding, index) => (
+        <li key={`${finding.id ?? "x"}-${index}`} className="flex items-start gap-2 text-sm text-ink">
+          <span className={`mt-0.5 shrink-0 rounded px-1.5 py-0.5 text-[11px] ${SEVERITY_STYLE[finding.severity]}`}>
+            {SEVERITY_LABEL[finding.severity]}
+          </span>
+          <span className="min-w-0">
+            {finding.id ? <span className="mr-1 font-mono text-[11px] text-faint">{finding.id}</span> : null}
+            {finding.title}
+            {finding.note ? <span className="ml-1 text-xs text-faint">({finding.note})</span> : null}
+          </span>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+/**
+ * Baris tugas yang sudah dihapus: snapshot verdict, ringkasan, dan temuan saat dihapus.
+ * Tidak ada laporan yang bisa dibuka dan tidak ada tautan ke tugasnya.
+ */
+function DeletedRow({ entry, expanded, onToggle }: { entry: DeletedRecapEntry; expanded: boolean; onToggle: () => void }) {
+  return (
+    <div data-recap-deleted={entry.taskId} className="rounded-lg border border-dashed border-line bg-panel px-3 py-2">
+      <button
+        type="button"
+        aria-expanded={expanded}
+        onClick={onToggle}
+        title={expanded ? "Tutup" : "Lihat ringkasan terakhir sebelum dihapus"}
+        className="flex w-full min-w-0 items-center gap-2 rounded text-left hover:opacity-80"
+      >
+        <span aria-hidden className="shrink-0 text-muted">
+          {expanded ? "▾" : "▸"}
+        </span>
+        <span className="shrink-0 font-mono text-[11px] text-faint line-through">{entry.taskId}</span>
+        <span className="shrink-0 text-[11px] text-faint">{ROLE_SHORT[entry.role]}</span>
+        {entry.verdict && (
+          <span className={`shrink-0 rounded px-1.5 py-0.5 text-[11px] opacity-70 ${TONE_STYLE[entry.verdict.tone]}`}>
+            {entry.verdict.text}
+          </span>
+        )}
+        <span title={stamp(entry.deletedAt)} className="shrink-0 rounded bg-hover px-1.5 py-0.5 text-[11px] text-muted">
+          dihapus {shortDate(entry.deletedAt)}
+        </span>
+        <span className="truncate text-sm text-faint">{preview(entry.summary ?? entry.title)}</span>
+      </button>
+
+      {expanded && (
+        <div className="mt-2 space-y-3 border-t border-line pt-2">
+          <p className="text-xs text-faint">{entry.title}</p>
+          <FindingList findings={entry.findings} />
+          {entry.summary && <p className="whitespace-pre-wrap break-words text-sm text-muted">{entry.summary}</p>}
+          <p className="text-xs text-faint">
+            Lampiran tidak tersedia — tugas sudah dihapus {stamp(entry.deletedAt)}. Yang tersisa hanya ringkasan terakhir
+            di atas.
+          </p>
+        </div>
+      )}
+    </div>
+  );
+}
+
 /** Laporan yang dibentangkan di-parse sekali per isi, bukan setiap rekap dimuat ulang. */
 const ReportMarkdown = memo(function ReportMarkdown({ text, taskId }: { text: string; taskId: string }) {
   const html = useMemo(() => renderMarkdown(text, taskId), [text, taskId]);
@@ -124,13 +191,16 @@ export function ProjectRecap({ projectId, search }: { projectId: string; search:
 
   const changedSinceSync = (entry: RecapEntry): boolean => Boolean(seenAt && entry.changedAt > seenAt);
 
-  const toggle = (entry: RecapEntry): void => {
+  const toggleOpen = (taskId: string): void =>
     setOpen((current) => {
       const next = new Set(current);
-      if (next.has(entry.taskId)) next.delete(entry.taskId);
-      else next.add(entry.taskId);
+      if (next.has(taskId)) next.delete(taskId);
+      else next.add(taskId);
       return next;
     });
+
+  const toggle = (entry: RecapEntry): void => {
+    toggleOpen(entry.taskId);
     if (entry.source !== "report" || reports[entry.taskId] !== undefined) return;
     void api
       .taskReport(entry.taskId)
@@ -156,6 +226,7 @@ export function ProjectRecap({ projectId, search }: { projectId: string; search:
             {totals.reports} laporan tugas
             {totals.summaries > 0 ? ` · ${totals.summaries} ringkasan operan` : ""}
             {recap.emptyCount > 0 ? ` · ${recap.emptyCount} tugas belum berlaporan` : ""}
+            {recap.deleted.length > 0 ? ` · ${recap.deleted.length} tugas dihapus` : ""}
             {totals.costUsd > 0 ? ` · $${totals.costUsd.toFixed(4)}` : ""}
           </p>
           {totals.reports > 0 && (
@@ -189,7 +260,7 @@ export function ProjectRecap({ projectId, search }: { projectId: string; search:
         </button>
       </div>
 
-      {entries.length === 0 && (
+      {entries.length === 0 && recap.deleted.length === 0 && (
         <p className={BOX}>
           Belum ada laporan di project ini. Laporan muncul setelah bot menulis <code>report.md</code> di folder
           tugasnya, atau setelah ia menutup pekerjaannya dengan ringkasan serah terima.
@@ -251,24 +322,7 @@ export function ProjectRecap({ projectId, search }: { projectId: string; search:
               <div className="mt-2 space-y-3 border-t border-line pt-2">
                 <p className="text-xs text-faint">{entry.title}</p>
 
-                {entry.findings.length > 0 && (
-                  <ul className="space-y-1">
-                    {entry.findings.map((finding, index) => (
-                      <li key={`${finding.id ?? "x"}-${index}`} className="flex items-start gap-2 text-sm text-ink">
-                        <span
-                          className={`mt-0.5 shrink-0 rounded px-1.5 py-0.5 text-[11px] ${SEVERITY_STYLE[finding.severity]}`}
-                        >
-                          {SEVERITY_LABEL[finding.severity]}
-                        </span>
-                        <span className="min-w-0">
-                          {finding.id ? <span className="mr-1 font-mono text-[11px] text-faint">{finding.id}</span> : null}
-                          {finding.title}
-                          {finding.note ? <span className="ml-1 text-xs text-faint">({finding.note})</span> : null}
-                        </span>
-                      </li>
-                    ))}
-                  </ul>
-                )}
+                <FindingList findings={entry.findings} />
 
                 {entry.source === "summary" && entry.summary && (
                   <p className="whitespace-pre-wrap break-words text-sm text-ink">{entry.summary}</p>
@@ -288,6 +342,15 @@ export function ProjectRecap({ projectId, search }: { projectId: string; search:
           </div>
         );
       })}
+
+      {recap.deleted.map((entry) => (
+        <DeletedRow
+          key={`deleted-${entry.taskId}`}
+          entry={entry}
+          expanded={open.has(`deleted:${entry.taskId}`)}
+          onToggle={() => toggleOpen(`deleted:${entry.taskId}`)}
+        />
+      ))}
     </div>
   );
 }

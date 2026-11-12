@@ -1,6 +1,7 @@
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { CONFIG } from "./config.ts";
+import { isDeleted } from "./deleted-tasks.ts";
 import { trimMemory } from "./memory.ts";
 import type { AutonomyMode, ContextUsage, RoleId } from "./types.ts";
 
@@ -113,11 +114,32 @@ export function onTasksChanged(listener: (task: Task) => void): () => void {
   return () => tasksListeners.delete(listener);
 }
 
+const removedListeners = new Set<(task: Task) => void>();
+
+/** Dipanggil setelah tugas dihapus — klien membuang tugas itu dari daftar dan menutup detailnya. */
+export function onTaskRemoved(listener: (task: Task) => void): () => void {
+  removedListeners.add(listener);
+  return () => removedListeners.delete(listener);
+}
+
 function metaPath(id: string): string {
   return join(taskDir(id), "task.json");
 }
 
+/** Folder tugas yang sedang dihapus; tidak pernah dimuat sebagai tugas. */
+const TRASH_PREFIX = ".deleted-";
+
+function purge(path: string): void {
+  try {
+    rmSync(path, { recursive: true, force: true });
+  } catch (error) {
+    console.error(`gagal membersihkan ${path}: ${(error as Error).message}`);
+  }
+}
+
 function persist(task: Task): void {
+  // Penulisan yang datang terlambat tidak boleh menghidupkan lagi folder tugas yang sudah dihapus.
+  if (isDeleted(task.id)) return;
   mkdirSync(taskDir(task.id), { recursive: true });
   const tmp = `${metaPath(task.id)}.tmp`;
   writeFileSync(tmp, JSON.stringify(task, null, 2));
@@ -138,6 +160,12 @@ export function loadTasks(): void {
   if (!existsSync(CONFIG.tasksDir)) return;
   for (const entry of readdirSync(CONFIG.tasksDir, { withFileTypes: true })) {
     if (!entry.isDirectory()) continue;
+    // Sisa penghapusan yang terputus (server mati di tengah rmSync): tuntaskan sekarang.
+    if (entry.name.startsWith(TRASH_PREFIX) || isDeleted(entry.name)) {
+      purge(join(CONFIG.tasksDir, entry.name));
+      continue;
+    }
+    if (entry.name.startsWith(".")) continue;
     const path = join(CONFIG.tasksDir, entry.name, "task.json");
     if (!existsSync(path)) continue;
     try {
@@ -158,9 +186,11 @@ function nextId(): string {
       next = index.size + 1;
     }
   }
-  while (index.has(`T-${String(next).padStart(3, "0")}`)) next += 1;
+  const idOf = (n: number): string => `T-${String(n).padStart(3, "0")}`;
+  // ID tugas yang sudah dihapus tetap terpakai: rujukannya di report project masih ada.
+  while (index.has(idOf(next)) || isDeleted(idOf(next))) next += 1;
   writeFileSync(CONFIG.counterPath, JSON.stringify({ next: next + 1 }));
-  return `T-${String(next).padStart(3, "0")}`;
+  return idOf(next);
 }
 
 // ---------- operasi ----------
@@ -193,6 +223,40 @@ export function createTask(input: {
 
 export function getTask(id: string): Task | undefined {
   return index.get(id);
+}
+
+/**
+ * Hapus tugas dari indeks dan disk. Foldernya dipindah dulu ke `.deleted-<id>-<ts>` (atomik),
+ * lalu `record` dipanggil — di situlah tombstone ditulis. Kalau `record` gagal, folder
+ * dikembalikan dan tidak ada yang berubah. Baru setelah itu isinya dihapus; kalau rmSync gagal,
+ * sisanya dibersihkan `loadTasks` saat server start berikutnya.
+ *
+ * Pemanggil wajib sudah menutup runner, browser, dan sesi Tanya tugas ini.
+ */
+export function removeTask(id: string, record: (task: Task) => void): Task | undefined {
+  const task = index.get(id);
+  if (!task) return undefined;
+  const dir = taskDir(id);
+  const trash = join(CONFIG.tasksDir, `${TRASH_PREFIX}${id}-${Date.now()}`);
+  const moved = existsSync(dir);
+  if (moved) renameSync(dir, trash);
+  try {
+    record(task);
+  } catch (error) {
+    if (moved) renameSync(trash, dir);
+    throw error;
+  }
+  index.delete(id);
+  summaryCache.delete(id);
+  for (const listener of removedListeners) {
+    try {
+      listener(task);
+    } catch {
+      // satu penyimak yang error tidak boleh menggagalkan penghapusan
+    }
+  }
+  if (moved) purge(trash);
+  return task;
 }
 
 export function updateTask(id: string, patch: Partial<Task>): Task | undefined {

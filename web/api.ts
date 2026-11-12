@@ -3,7 +3,9 @@ import type { Settings } from "../server/settings.ts";
 import type { Assignment, Review, Task, TaskStatus, TaskSummary } from "../server/tasks.ts";
 import type { Project } from "../server/projects.ts";
 import type { AskMessage } from "../server/agent/ask.ts";
+import type { DeletedRef } from "../server/deleted-tasks.ts";
 import type {
+  DeletedRecapEntry,
   ProjectRecap,
   RecapEntry,
   RecapFinding,
@@ -14,7 +16,7 @@ import type {
 } from "../server/recap.ts";
 
 export type { AskMessage, Assignment, AttentionEvent, AutonomyMode, ContextUsage, Project, RoleId, Review, Settings, StoredEvent, Task, TaskStatus, TaskSummary, UiEvent, WorkerStatus };
-export type { ProjectRecap, RecapEntry, RecapFinding, RecapSeverity, RecapTone, RecapTotals, RecapVerdict };
+export type { DeletedRecapEntry, DeletedRef, ProjectRecap, RecapEntry, RecapFinding, RecapSeverity, RecapTone, RecapTotals, RecapVerdict };
 export type { CoverageCell, CoverageState, Finding, FindingSeverity, FindingStatus, UnlinkedFinding } from "../server/findings.ts";
 export type { CuratorStatus } from "../server/agent/curator.ts";
 
@@ -48,6 +50,8 @@ export type ProjectReport = {
   unlinked: import("../server/findings.ts").UnlinkedFinding[];
   counts: Record<string, number>;
   coverage: import("../server/findings.ts").CoverageCell[];
+  /** Tugas dihapus yang masih dirujuk register, cakupan, atau rekap — diberi label "dihapus". */
+  deletedTasks: Record<string, DeletedRef>;
   curator: import("../server/agent/curator.ts").CuratorStatus;
   log: CurationLogItem[];
   recap: ProjectRecap;
@@ -196,6 +200,12 @@ export const api = {
     request<{ ok: true }>(`/api/tasks/${id}/message`, { method: "POST", body: JSON.stringify({ text }) }),
   interrupt: (id: string) => request<{ ok: true }>(`/api/tasks/${id}/interrupt`, { method: "POST" }),
   cancel: (id: string) => request<{ ok: true }>(`/api/tasks/${id}/cancel`, { method: "POST" }),
+  /** `confirm` harus sama persis dengan ID tugas — server menolak kalau tidak. */
+  deleteTask: (id: string, confirm: string) =>
+    request<{ ok: true; projectId: string }>(`/api/tasks/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+      body: JSON.stringify({ confirm }),
+    }),
   handoff: (id: string, body: { role: RoleId; note?: string }) =>
     request<{ ok: true; task: Task }>(`/api/tasks/${id}/handoff`, { method: "POST", body: JSON.stringify(body) }),
   review: (id: string, body: { status: "approved" | "changes_requested"; comment: string; sendBackToAgent: boolean }) =>
